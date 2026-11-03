@@ -45,6 +45,9 @@ pub enum Step {
         /// The target changes every run ("map chưa đi"), so it always needs the AI.
         #[serde(default)]
         dynamic: bool,
+        /// Text that must NOT be on or right above the element ("Hoàn toàn thu hồi").
+        #[serde(default)]
+        exclude: Vec<String>,
         #[serde(default)]
         rec: Option<Rec>,
     },
@@ -55,6 +58,8 @@ pub enum Step {
         #[serde(default = "d_max_tap_all")]
         max: u32,
         #[serde(default)]
+        exclude: Vec<String>,
+        #[serde(default)]
         rec: Option<Rec>,
     },
     WaitUntil {
@@ -62,6 +67,8 @@ pub enum Step {
         target: String,
         #[serde(default = "d_timeout")]
         timeout_sec: u32,
+        #[serde(default)]
+        exclude: Vec<String>,
         #[serde(default)]
         rec: Option<Rec>,
     },
@@ -86,15 +93,44 @@ pub struct Node {
     /// The AI's interpretation; None until it has been analysed.
     #[serde(default)]
     pub step: Option<Step>,
+    /// "Nếu không thấy thì…": run this when the step finds nothing, then try again.
+    #[serde(default)]
+    pub otherwise: Option<Box<Node>>,
+    /// How many times `otherwise` may run before giving up (e.g. pages to flip).
+    #[serde(default = "d_otherwise_max")]
+    pub otherwise_max: u32,
+    /// Part of the screen to search, as fractions [x1, y1, x2, y2] of its size.
+    #[serde(default)]
+    pub region: Option<[f32; 4]>,
+}
+
+fn d_otherwise_max() -> u32 {
+    10
 }
 
 impl Node {
     pub fn new() -> Self {
-        Self { text: String::new(), step: None }
+        Self::with_text("")
+    }
+
+    pub fn with_text(text: &str) -> Self {
+        Self {
+            text: text.into(),
+            step: None,
+            otherwise: None,
+            otherwise_max: d_otherwise_max(),
+            region: None,
+        }
     }
 
     pub fn new_loop() -> Self {
-        Self { text: String::new(), step: Some(Step::Loop { max: 50, steps: vec![Node::new()] }) }
+        Self {
+            step: Some(Step::Loop {
+                max: 50,
+                steps: vec![Node::new()],
+            }),
+            ..Self::new()
+        }
     }
 
     pub fn is_loop(&self) -> bool {
@@ -106,78 +142,202 @@ impl Step {
     /// Short Vietnamese summary of how the AI understood a step.
     pub fn describe(&self) -> String {
         match self {
-            Step::Tap { target, hint, dynamic, .. } => {
+            Step::Tap {
+                target,
+                hint,
+                dynamic,
+                exclude,
+                ..
+            } => {
                 let mut s = format!("Bấm \"{target}\"");
                 if !hint.is_empty() {
                     s += &format!(" ở {hint}");
+                }
+                if !exclude.is_empty() {
+                    s += &format!(" · bỏ qua ô có chữ {}", quote_list(exclude));
                 }
                 if *dynamic {
                     s += " · AI tìm lại mỗi lần chạy";
                 }
                 s
             }
+            Step::TapAll {
+                target,
+                max,
+                exclude,
+                ..
+            } if !exclude.is_empty() => {
+                format!(
+                    "Bấm hết các \"{target}\" (tối đa {max}) · bỏ qua ô có chữ {}",
+                    quote_list(exclude)
+                )
+            }
             Step::TapAll { target, max, .. } => format!("Bấm hết các \"{target}\" (tối đa {max})"),
-            Step::WaitUntil { target, timeout_sec, .. } => format!("Đợi đến khi thấy \"{target}\" (tối đa {timeout_sec}s)"),
+            Step::WaitUntil {
+                target,
+                timeout_sec,
+                ..
+            } => format!("Đợi đến khi thấy \"{target}\" (tối đa {timeout_sec}s)"),
             Step::Wait { seconds } => format!("Chờ {seconds} giây"),
             Step::Back => "Nhấn Back".to_string(),
             Step::Loop { max, .. } => format!("Lặp tối đa {max} lần"),
         }
     }
 
+    pub fn exclude(&self) -> &[String] {
+        match self {
+            Step::Tap { exclude, .. }
+            | Step::TapAll { exclude, .. }
+            | Step::WaitUntil { exclude, .. } => exclude,
+            _ => &[],
+        }
+    }
+
     /// Drops what was learned.
     pub fn clear_rec(&mut self) {
         match self {
-            Step::Tap { rec, .. } | Step::TapAll { rec, .. } | Step::WaitUntil { rec, .. } => *rec = None,
+            Step::Tap { rec, .. } | Step::TapAll { rec, .. } | Step::WaitUntil { rec, .. } => {
+                *rec = None
+            }
             Step::Loop { steps, .. } => clear_rec(steps),
             _ => {}
         }
     }
 }
 
+fn quote_list(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|t| format!("\"{t}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub fn clear_rec(nodes: &mut [Node]) {
-    for n in nodes {
+    for_each_leaf_mut(nodes, &mut |n| {
         if let Some(s) = &mut n.step {
             s.clear_rec();
         }
-    }
+    });
 }
 
-/// Calls `f` on every non-loop node, depth first.
+/// Calls `f` on every non-loop node (and then on its "nếu không thấy" node), depth first.
 pub fn for_each_leaf_mut(nodes: &mut [Node], f: &mut dyn FnMut(&mut Node)) {
     for n in nodes {
         match &mut n.step {
             Some(Step::Loop { steps, .. }) => for_each_leaf_mut(steps, f),
-            _ => f(n),
+            _ => {
+                f(n);
+                if let Some(o) = n.otherwise.as_deref_mut() {
+                    f(o);
+                }
+            }
         }
     }
 }
 
-pub const CLOSE_TARGET: &str = "nút đóng hoặc quay lại (dấu X hoặc mũi tên quay lại)";
+/// Text buttons first: an early "dấu X hoặc mũi tên" wording made the model pick
+/// crossed-swords battle icons and map arrows instead of "Trở lại".
+pub const CLOSE_TARGET: &str = "nút để quay lại / thoát khỏi màn hình này (thường ở góc trên: chữ \"Trở lại\", \"Quay lại\", \"Đóng\", \"Thoát\", nút mũi tên quay lại, hoặc nút X đóng cửa sổ)";
+/// Wording used by earlier versions, still found in saved scenarios.
+const OLD_CLOSE_TARGET: &str = "nút đóng hoặc quay lại (dấu X hoặc mũi tên quay lại)";
 
 /// "đóng", "nút thoát", "quay lại"... – games draw these very differently,
 /// so they get one generic description and an Android Back fallback.
 pub fn is_close_target(target: &str) -> bool {
     let t = target.trim().to_lowercase();
-    let t = t.strip_prefix("nút ").or_else(|| t.strip_prefix("button ")).unwrap_or(&t).trim();
+    let t = t
+        .strip_prefix("nút ")
+        .or_else(|| t.strip_prefix("button "))
+        .unwrap_or(&t)
+        .trim();
     t == CLOSE_TARGET.to_lowercase().trim_start_matches("nút ")
-        || ["đóng", "đóng lại", "thoát", "thoát ra", "quay lại", "trở lại", "x", "close", "back"].contains(&t)
+        || t == OLD_CLOSE_TARGET.trim_start_matches("nút ")
+        || [
+            "đóng",
+            "đóng lại",
+            "thoát",
+            "thoát ra",
+            "quay lại",
+            "trở lại",
+            "x",
+            "close",
+            "back",
+        ]
+        .contains(&t)
 }
 
 /// Many games ignore Android Back, so "back" becomes a tap on the on-screen close
 /// button (which still falls back to Android Back if none is visible).
 pub fn normalize(step: Step) -> Step {
     match step {
-        Step::Back => Step::Tap { target: CLOSE_TARGET.into(), hint: String::new(), dynamic: false, rec: None },
-        Step::Tap { target, hint, dynamic, rec } if is_close_target(&target) => Step::Tap { target: CLOSE_TARGET.into(), hint, dynamic, rec },
-        Step::Tap { target, hint, dynamic, rec } => Step::Tap { target: strip_verb(&target), hint, dynamic, rec },
-        Step::TapAll { target, hint, max, rec } => Step::TapAll { target: strip_verb(&target), hint, max, rec },
+        Step::Back => Step::Tap {
+            target: CLOSE_TARGET.into(),
+            hint: String::new(),
+            dynamic: false,
+            exclude: Vec::new(),
+            rec: None,
+        },
+        Step::Tap {
+            target,
+            hint,
+            dynamic,
+            exclude,
+            rec,
+        } if is_close_target(&target) => Step::Tap {
+            target: CLOSE_TARGET.into(),
+            hint,
+            dynamic,
+            exclude,
+            rec,
+        },
+        Step::Tap {
+            target,
+            hint,
+            dynamic,
+            exclude,
+            rec,
+        } => {
+            // Which element passes the text filter changes from run to run.
+            let dynamic = dynamic || !exclude.is_empty();
+            Step::Tap {
+                target: strip_verb(&target),
+                hint,
+                dynamic,
+                exclude,
+                rec,
+            }
+        }
+        Step::TapAll {
+            target,
+            hint,
+            max,
+            exclude,
+            rec,
+        } => Step::TapAll {
+            target: strip_verb(&target),
+            hint,
+            max,
+            exclude,
+            rec,
+        },
         s => s,
     }
 }
 
 /// The model sometimes keeps the verb in the button name ("Vô túi đồ" → "túi đồ").
 fn strip_verb(target: &str) -> String {
-    const VERBS: [&str; 9] = ["bấm vào ", "nhấn vào ", "click vào ", "vô ", "vào ", "bấm ", "nhấn ", "click ", "mở "];
+    const VERBS: [&str; 9] = [
+        "bấm vào ",
+        "nhấn vào ",
+        "click vào ",
+        "vô ",
+        "vào ",
+        "bấm ",
+        "nhấn ",
+        "click ",
+        "mở ",
+    ];
     let lower = target.trim().to_lowercase();
     for v in VERBS {
         if lower.starts_with(v) {
@@ -269,7 +429,10 @@ impl Scenario {
 
     pub fn save(&self) -> Result<()> {
         fs::create_dir_all(self.dir())?;
-        fs::write(self.dir().join("scenario.json"), serde_json::to_string_pretty(self)?)?;
+        fs::write(
+            self.dir().join("scenario.json"),
+            serde_json::to_string_pretty(self)?,
+        )?;
         Ok(())
     }
 
@@ -297,10 +460,15 @@ impl Scenario {
 
     /// Reads a `.omnipilot` file into a new scenario (fresh id, so imports never clash).
     pub fn import(path: &Path) -> Result<Scenario> {
-        let mut archive = zip::ZipArchive::new(fs::File::open(path)?).context("file không phải kịch bản OmniPilot")?;
+        let mut archive = zip::ZipArchive::new(fs::File::open(path)?)
+            .context("file không phải kịch bản OmniPilot")?;
         let mut json = String::new();
-        archive.by_name("scenario.json").context("file thiếu scenario.json")?.read_to_string(&mut json)?;
-        let mut sc: Scenario = serde_json::from_str(strip_bom(&json)).context("scenario.json không hợp lệ")?;
+        archive
+            .by_name("scenario.json")
+            .context("file thiếu scenario.json")?
+            .read_to_string(&mut json)?;
+        let mut sc: Scenario =
+            serde_json::from_str(strip_bom(&json)).context("scenario.json không hợp lệ")?;
         sc.id = uuid::Uuid::new_v4().simple().to_string();
 
         let mut names = Vec::new();
@@ -328,13 +496,25 @@ fn strip_bom(s: &str) -> &str {
 }
 
 fn is_template_name(name: &str) -> bool {
-    name.starts_with("tpl_") && name.ends_with(".png") && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') && !name.contains("..")
+    name.starts_with("tpl_")
+        && name.ends_with(".png")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        && !name.contains("..")
 }
 
 fn collect_templates(nodes: &[Node], out: &mut Vec<String>) {
     for n in nodes {
+        if let Some(o) = &n.otherwise {
+            collect_templates(std::slice::from_ref(o.as_ref()), out);
+        }
         match &n.step {
-            Some(Step::Tap { rec: Some(r), .. } | Step::TapAll { rec: Some(r), .. } | Step::WaitUntil { rec: Some(r), .. }) => out.push(r.template.clone()),
+            Some(
+                Step::Tap { rec: Some(r), .. }
+                | Step::TapAll { rec: Some(r), .. }
+                | Step::WaitUntil { rec: Some(r), .. },
+            ) => out.push(r.template.clone()),
             Some(Step::Loop { steps, .. }) => collect_templates(steps, out),
             _ => {}
         }
@@ -342,7 +522,9 @@ fn collect_templates(nodes: &[Node], out: &mut Vec<String>) {
 }
 
 pub fn load_all() -> Vec<Scenario> {
-    let Ok(entries) = fs::read_dir(paths::scenarios_dir()) else { return Vec::new() };
+    let Ok(entries) = fs::read_dir(paths::scenarios_dir()) else {
+        return Vec::new();
+    };
     let mut list: Vec<Scenario> = entries
         .flatten()
         .filter_map(|e| fs::read_to_string(e.path().join("scenario.json")).ok())

@@ -24,13 +24,23 @@ pub fn find_ldplayer() -> Option<PathBuf> {
         if !root.exists() {
             continue;
         }
-        for parent in [root.join("LDPlayer"), root.join("Program Files").join("LDPlayer"), root.clone()] {
-            let Ok(entries) = std::fs::read_dir(&parent) else { continue };
+        for parent in [
+            root.join("LDPlayer"),
+            root.join("Program Files").join("LDPlayer"),
+            root.clone(),
+        ] {
+            let Ok(entries) = std::fs::read_dir(&parent) else {
+                continue;
+            };
             let mut found: Vec<PathBuf> = entries
                 .flatten()
                 .map(|e| e.path())
                 .filter(|p| {
-                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
+                    let name = p
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_lowercase();
                     name.starts_with("ldplayer") && is_ldplayer_dir(p)
                 })
                 .collect();
@@ -50,7 +60,11 @@ pub fn is_ldplayer_dir(dir: &Path) -> bool {
 
 fn version_of(p: &Path) -> u32 {
     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    name.chars().filter(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap_or(0)
+    name.chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Debug)]
@@ -79,13 +93,21 @@ pub fn list_instances(ld_dir: &Path) -> Result<Vec<Instance>> {
                 return None;
             }
             let size = [f[7].parse().unwrap_or(0), f[8].parse().unwrap_or(0)];
-            Some(Instance { index: f[0].parse().ok()?, name: f[1].to_string(), running: f[4] == "1", size })
+            Some(Instance {
+                index: f[0].parse().ok()?,
+                name: f[1].to_string(),
+                running: f[4] == "1",
+                size,
+            })
         })
         .collect())
 }
 
 pub fn launch_instance(ld_dir: &Path, index: u32) -> Result<()> {
-    run(&ld_dir.join("ldconsole.exe"), &["launch", "--index", &index.to_string()])?;
+    run(
+        &ld_dir.join("ldconsole.exe"),
+        &["launch", "--index", &index.to_string()],
+    )?;
     Ok(())
 }
 
@@ -103,7 +125,10 @@ pub struct Device {
 
 impl Device {
     pub fn new(ld_dir: &Path, instance: &Instance) -> Self {
-        Self { adb: ld_dir.join("adb.exe"), serial: instance.serial() }
+        Self {
+            adb: ld_dir.join("adb.exe"),
+            serial: instance.serial(),
+        }
     }
 
     fn adb(&self, args: &[&str]) -> Result<Output> {
@@ -111,13 +136,19 @@ impl Device {
         full.extend_from_slice(args);
         let out = run(&self.adb, &full)?;
         if !out.status.success() {
-            bail!("adb {:?} lỗi: {}", args, String::from_utf8_lossy(&out.stderr).trim());
+            bail!(
+                "adb {:?} lỗi: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
         Ok(out)
     }
 
     pub fn is_online(&self) -> bool {
-        self.adb(&["get-state"]).map(|o| String::from_utf8_lossy(&o.stdout).trim() == "device").unwrap_or(false)
+        self.adb(&["get-state"])
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "device")
+            .unwrap_or(false)
     }
 
     pub fn connect(&self) {
@@ -126,8 +157,13 @@ impl Device {
 
     pub fn screenshot(&self) -> Result<Frame> {
         let out = self.adb(&["exec-out", "screencap", "-p"])?;
-        let img = image::load_from_memory(&out.stdout).context("ảnh chụp màn hình không hợp lệ")?.to_rgba8();
-        Ok(Frame { png: out.stdout, img })
+        let img = image::load_from_memory(&out.stdout)
+            .context("ảnh chụp màn hình không hợp lệ")?
+            .to_rgba8();
+        Ok(Frame {
+            png: out.stdout,
+            img,
+        })
     }
 
     pub fn tap(&self, x: u32, y: u32) -> Result<()> {

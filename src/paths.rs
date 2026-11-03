@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 /// %LOCALAPPDATA%\OmniPilot
 pub fn data_dir() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     base.join("OmniPilot")
 }
 

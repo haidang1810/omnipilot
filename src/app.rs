@@ -24,11 +24,17 @@ struct Settings {
 
 impl Settings {
     fn load() -> Self {
-        std::fs::read_to_string(paths::settings_file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+        std::fs::read_to_string(paths::settings_file())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
     }
     fn save(&self) {
         let _ = std::fs::create_dir_all(paths::data_dir());
-        let _ = std::fs::write(paths::settings_file(), serde_json::to_string_pretty(self).unwrap_or_default());
+        let _ = std::fs::write(
+            paths::settings_file(),
+            serde_json::to_string_pretty(self).unwrap_or_default(),
+        );
     }
 }
 
@@ -39,34 +45,137 @@ struct ScreenView {
     size: [u32; 2],
     tap: Option<(u32, u32)>,
     shown_gen: u64,
+    /// Start and current pointer position while the user drags out a search area.
+    drag: Option<(egui::Pos2, egui::Pos2)>,
 }
 
 impl ScreenView {
     fn set(&mut self, ctx: &egui::Context, img: &RgbaImage, tap: Option<(u32, u32)>) {
-        let color = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+        let color = egui::ColorImage::from_rgba_unmultiplied(
+            [img.width() as usize, img.height() as usize],
+            img.as_raw(),
+        );
         match &mut self.tex {
             Some(t) => t.set(color, egui::TextureOptions::LINEAR),
-            None => self.tex = Some(ctx.load_texture("screen", color, egui::TextureOptions::LINEAR)),
+            None => {
+                self.tex = Some(ctx.load_texture("screen", color, egui::TextureOptions::LINEAR))
+            }
         }
         self.size = [img.width(), img.height()];
         self.tap = tap;
     }
 
-    fn ui(&self, ui: &mut egui::Ui) {
+    /// Draws the screen with the last tap and `region` (fractions of the screen) on top.
+    /// With `picking`, the user drags out a new area, which is returned when released.
+    fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        region: Option<[f32; 4]>,
+        picking: bool,
+    ) -> Option<[f32; 4]> {
         let w = ui.available_width();
         let Some(tex) = &self.tex else {
             let (rect, _) = ui.allocate_exact_size(vec2(w, w * 9.0 / 16.0), egui::Sense::hover());
             ui.painter().rect_filled(rect, 10, theme::INPUT);
-            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, format!("{}  Chưa có ảnh màn hình", ic::DEVICE_MOBILE_SPEAKER), egui::FontId::proportional(15.0), MUTED);
-            return;
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                format!("{}  Chưa có ảnh màn hình", ic::DEVICE_MOBILE_SPEAKER),
+                egui::FontId::proportional(15.0),
+                MUTED,
+            );
+            return None;
         };
         let size = vec2(w, w * self.size[1] as f32 / self.size[0] as f32);
-        let resp = ui.add(egui::Image::new((tex.id(), size)).corner_radius(10));
+        let sense = if picking {
+            egui::Sense::drag()
+        } else {
+            egui::Sense::hover()
+        };
+        let resp = ui.add(
+            egui::Image::new((tex.id(), size))
+                .corner_radius(10)
+                .sense(sense),
+        );
+        let rect = resp.rect;
+        let to_screen = |f: [f32; 4]| {
+            egui::Rect::from_two_pos(
+                rect.lerp_inside(vec2(f[0], f[1])),
+                rect.lerp_inside(vec2(f[2], f[3])),
+            )
+        };
+        let to_frac = |p: egui::Pos2| {
+            let v = (p - rect.min) / rect.size();
+            [v.x.clamp(0.0, 1.0), v.y.clamp(0.0, 1.0)]
+        };
+
+        if let Some(r) = region {
+            let r = to_screen(r);
+            ui.painter().rect_filled(r, 4, ACCENT.gamma_multiply(0.12));
+            ui.painter().rect_stroke(
+                r,
+                4,
+                egui::Stroke::new(2.0_f32, ACCENT),
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().text(
+                r.left_top() + vec2(6.0, 4.0),
+                egui::Align2::LEFT_TOP,
+                "Vùng tìm",
+                egui::FontId::new(13.0, theme::bold()),
+                ACCENT,
+            );
+        }
         if let Some((x, y)) = self.tap {
-            let p = resp.rect.min + vec2(x as f32 / self.size[0] as f32 * size.x, y as f32 / self.size[1] as f32 * size.y);
-            ui.painter().circle_stroke(p, 13.0, egui::Stroke::new(3.0_f32, RED));
+            let p = rect.min
+                + vec2(
+                    x as f32 / self.size[0] as f32 * size.x,
+                    y as f32 / self.size[1] as f32 * size.y,
+                );
+            ui.painter()
+                .circle_stroke(p, 13.0, egui::Stroke::new(3.0_f32, RED));
             ui.painter().circle_filled(p, 3.5, RED);
         }
+        if !picking {
+            self.drag = None;
+            return None;
+        }
+
+        let resp = resp.on_hover_cursor(egui::CursorIcon::Crosshair);
+        if resp.drag_started() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                self.drag = Some((p, p));
+            }
+        }
+        if let (Some((start, _)), Some(p)) = (self.drag, resp.interact_pointer_pos()) {
+            self.drag = Some((start, p));
+        }
+        if let Some((a, b)) = self.drag {
+            let r = egui::Rect::from_two_pos(a, b);
+            ui.painter().rect_filled(r, 4, YELLOW.gamma_multiply(0.15));
+            ui.painter().rect_stroke(
+                r,
+                4,
+                egui::Stroke::new(2.0_f32, YELLOW),
+                egui::StrokeKind::Inside,
+            );
+        }
+        if resp.drag_stopped() {
+            if let Some((a, b)) = self.drag.take() {
+                let (fa, fb) = (to_frac(a), to_frac(b));
+                let f = [
+                    fa[0].min(fb[0]),
+                    fa[1].min(fb[1]),
+                    fa[0].max(fb[0]),
+                    fa[1].max(fb[1]),
+                ];
+                // Ignore clicks / tiny drags.
+                if f[2] - f[0] > 0.03 && f[3] - f[1] > 0.03 {
+                    return Some(f);
+                }
+            }
+        }
+        None
     }
 }
 
@@ -99,6 +208,10 @@ struct Editor {
     /// Some(..) after a trial run finished.
     trial: Option<Result<(), String>>,
     error: Option<String>,
+    /// Path of the step whose search area is being dragged out on the screenshot.
+    picking: Option<Vec<usize>>,
+    /// A screenshot being taken for picking search areas.
+    shot_rx: Option<Receiver<Result<RgbaImage, String>>>,
 }
 
 impl Editor {
@@ -122,6 +235,8 @@ impl Editor {
             screen: ScreenView::default(),
             trial: None,
             error: None,
+            picking: None,
+            shot_rx: None,
         }
     }
 
@@ -144,10 +259,17 @@ impl Editor {
             let log = move |s: String| {
                 let _ = log_tx.send(TaskMsg::Event(Event::Log(s)));
             };
-            let r = compile_nodes(&ai, &mut nodes, &log).map(|_| nodes).map_err(|e| format!("{e:#}"));
+            let r = compile_nodes(&ai, &mut nodes, &log)
+                .map(|_| nodes)
+                .map_err(|e| format!("{e:#}"));
             let _ = tx.send(TaskMsg::Compiled(r));
         });
-        self.task = Some(Task { rx, stop: Arc::new(AtomicBool::new(false)), label: "AI đang đọc các bước...", analyse_only: true });
+        self.task = Some(Task {
+            rx,
+            stop: Arc::new(AtomicBool::new(false)),
+            label: "AI đang đọc các bước...",
+            analyse_only: true,
+        });
     }
 
     fn start_trial(&mut self, ld: PathBuf, inst: Instance) {
@@ -180,10 +302,39 @@ impl Editor {
             })();
             let _ = tx.send(TaskMsg::TrialDone(r.map_err(|e| format!("{e:#}"))));
         });
-        self.task = Some(Task { rx, stop, label: "Đang chạy thử...", analyse_only: false });
+        self.task = Some(Task {
+            rx,
+            stop,
+            label: "Đang chạy thử...",
+            analyse_only: false,
+        });
+    }
+
+    /// Grabs the emulator's current screen in the background (for picking search areas).
+    fn capture(&mut self, ld: PathBuf, inst: Instance) {
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let dev = device::Device::new(&ld, &inst);
+            dev.connect();
+            let _ = tx.send(
+                dev.screenshot()
+                    .map(|f| f.img)
+                    .map_err(|e| format!("Không chụp được màn hình: {e:#}")),
+            );
+        });
+        self.shot_rx = Some(rx);
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.shot_rx {
+            if let Ok(r) = rx.try_recv() {
+                match r {
+                    Ok(img) => self.screen.set(ctx, &img, None),
+                    Err(e) => self.error = Some(e),
+                }
+                self.shot_rx = None;
+            }
+        }
         let Some(task) = &self.task else { return };
         let analyse_only = task.analyse_only;
         let mut finished = false;
@@ -203,7 +354,10 @@ impl Editor {
                     finished = true;
                     match r {
                         Ok((nodes, size)) => {
-                            jobs::push_log(&mut self.log, "Chạy thử xong. Kiểm tra lại game xem đã đúng chưa.".into());
+                            jobs::push_log(
+                                &mut self.log,
+                                "Chạy thử xong. Kiểm tra lại game xem đã đúng chưa.".into(),
+                            );
                             self.sc.steps = nodes;
                             self.sc.screen_size = size;
                             self.trial = Some(Ok(()));
@@ -262,10 +416,16 @@ fn compile_nodes(ai: &SharedAi, nodes: &mut Vec<Node>, log: &dyn Fn(String)) -> 
         if n.step.is_some() || err.is_some() {
             return;
         }
-        match server.compile_step(&n.text) {
-            Ok(s) => {
-                log(format!("AI hiểu \"{}\" → {}", n.text, s.describe()));
-                n.step = Some(s);
+        match server.compile_node(n) {
+            Ok(()) => {
+                log(format!(
+                    "AI hiểu \"{}\" → {}",
+                    n.text,
+                    n.step.as_ref().map(Step::describe).unwrap_or_default()
+                ));
+                if let Some(o) = &n.otherwise {
+                    log(format!("  nếu không thấy thì: \"{}\"", o.text));
+                }
             }
             Err(e) => err = Some(e),
         }
@@ -331,11 +491,19 @@ impl App {
             Page::Setup
         };
         let mut settings = Settings::load();
-        if settings.ld_dir.as_ref().is_none_or(|d| !device::is_ldplayer_dir(d)) {
+        if settings
+            .ld_dir
+            .as_ref()
+            .is_none_or(|d| !device::is_ldplayer_dir(d))
+        {
             settings.ld_dir = device::find_ldplayer();
             settings.save();
         }
-        let ld_text = settings.ld_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default();
+        let ld_text = settings
+            .ld_dir
+            .as_ref()
+            .map(|d| d.display().to_string())
+            .unwrap_or_default();
         let mut app = Self {
             page,
             setup,
@@ -353,7 +521,16 @@ impl App {
         };
         app.refresh_instances();
         if std::env::args().any(|a| a == "--demo") {
-            app.editor = Some(Editor::new(demo_scenario(&app.instances), true));
+            let mut ed = Editor::new(demo_scenario(&app.instances), true);
+            // Show the search-area picker on the live screen.
+            if let (Some(ld), Some(inst)) = (
+                &app.settings.ld_dir,
+                app.instances.iter().find(|i| i.running),
+            ) {
+                ed.capture(ld.clone(), inst.clone());
+                ed.picking = Some(vec![1, 0]);
+            }
+            app.editor = Some(ed);
         }
         app
     }
@@ -373,7 +550,12 @@ impl App {
                 Ok(list) => self.instances = list,
                 Err(e) => self.inst_error = Some(format!("{e:#}")),
             },
-            None => self.inst_error = Some("Không tìm thấy LDPlayer. Nhập thư mục cài LDPlayer (chứa ldconsole.exe).".into()),
+            None => {
+                self.inst_error = Some(
+                    "Không tìm thấy LDPlayer. Nhập thư mục cài LDPlayer (chứa ldconsole.exe)."
+                        .into(),
+                )
+            }
         }
     }
 
@@ -391,25 +573,46 @@ impl App {
                     ui.vertical_centered(|ui| {
                         ui.label(RichText::new(ic::ROBOT).size(42.0).color(ACCENT));
                         ui.heading("Chuẩn bị lần đầu");
-                        ui.label(theme::muted("Đang tải AI chạy trên máy (~3,3GB). Chỉ tải một lần duy nhất."));
+                        ui.label(theme::muted(
+                            "Đang tải AI chạy trên máy (~3,3GB). Chỉ tải một lần duy nhất.",
+                        ));
                         ui.add_space(14.0);
                         if let Some(err) = &p.error {
                             ui.colored_label(RED, format!("Lỗi: {err}"));
                             ui.add_space(6.0);
-                            if ui.add(theme::button(format!("{} Thử lại", ic::ARROWS_CLOCKWISE), ACCENT)).clicked() {
+                            if ui
+                                .add(theme::button(
+                                    format!("{} Thử lại", ic::ARROWS_CLOCKWISE),
+                                    ACCENT,
+                                ))
+                                .clicked()
+                            {
                                 *self.setup.lock().unwrap() = setup::Progress::default();
                                 setup::start(self.setup.clone());
                             }
                             return;
                         }
-                        ui.label(format!("Bước {}/{} · {}", p.step, p.total_steps.max(1), p.label));
-                        let frac = if p.size > 0 { p.downloaded as f32 / p.size as f32 } else { 0.0 };
+                        ui.label(format!(
+                            "Bước {}/{} · {}",
+                            p.step,
+                            p.total_steps.max(1),
+                            p.label
+                        ));
+                        let frac = if p.size > 0 {
+                            p.downloaded as f32 / p.size as f32
+                        } else {
+                            0.0
+                        };
                         ui.add(
                             egui::ProgressBar::new(frac)
                                 .desired_width(440.0)
                                 .fill(ACCENT)
                                 .corner_radius(6)
-                                .text(format!("{:.0} / {:.0} MB", p.downloaded as f64 / 1e6, p.size as f64 / 1e6)),
+                                .text(format!(
+                                    "{:.0} / {:.0} MB",
+                                    p.downloaded as f64 / 1e6,
+                                    p.size as f64 / 1e6
+                                )),
                         );
                     });
                 });
@@ -418,31 +621,57 @@ impl App {
     }
 
     fn header(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("top").frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(20, 14))).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(ic::GAME_CONTROLLER).size(26.0).color(ACCENT));
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    ui.label(RichText::new("OmniPilot").family(theme::bold()).size(20.0));
-                    ui.label(RichText::new("Auto mọi game trên LDPlayer").size(12.5).color(MUTED));
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(theme::button(format!("{} Tạo kịch bản", ic::PLUS), ACCENT)).clicked() {
-                        let mut sc = Scenario::new();
-                        if let Some(i) = self.instances.iter().find(|i| i.running).or(self.instances.first()) {
-                            sc.instance_index = i.index;
+        egui::TopBottomPanel::top("top")
+            .frame(
+                egui::Frame::new()
+                    .fill(PANEL)
+                    .inner_margin(Margin::symmetric(20, 14)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(ic::GAME_CONTROLLER).size(26.0).color(ACCENT));
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.label(RichText::new("OmniPilot").family(theme::bold()).size(20.0));
+                        ui.label(
+                            RichText::new("Auto mọi game trên LDPlayer")
+                                .size(12.5)
+                                .color(MUTED),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(theme::button(format!("{} Tạo kịch bản", ic::PLUS), ACCENT))
+                            .clicked()
+                        {
+                            let mut sc = Scenario::new();
+                            if let Some(i) = self
+                                .instances
+                                .iter()
+                                .find(|i| i.running)
+                                .or(self.instances.first())
+                            {
+                                sc.instance_index = i.index;
+                            }
+                            self.editor = Some(Editor::new(sc, true));
                         }
-                        self.editor = Some(Editor::new(sc, true));
-                    }
-                    if ui.button(format!("{} Nhập", ic::DOWNLOAD_SIMPLE)).on_hover_text("Mở file .omnipilot người khác chia sẻ").clicked() {
-                        self.import_dialog();
-                    }
-                    if ui.button(ic::ARROWS_CLOCKWISE).on_hover_text("Làm mới danh sách giả lập").clicked() {
-                        self.refresh_instances();
-                    }
+                        if ui
+                            .button(format!("{} Nhập", ic::DOWNLOAD_SIMPLE))
+                            .on_hover_text("Mở file .omnipilot người khác chia sẻ")
+                            .clicked()
+                        {
+                            self.import_dialog();
+                        }
+                        if ui
+                            .button(ic::ARROWS_CLOCKWISE)
+                            .on_hover_text("Làm mới danh sách giả lập")
+                            .clicked()
+                        {
+                            self.refresh_instances();
+                        }
+                    });
                 });
             });
-        });
     }
 
     fn banners(&mut self, ui: &mut egui::Ui) {
@@ -450,7 +679,12 @@ impl App {
             theme::card_frame(RED).show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(format!("{} {err}", ic::WARNING)).color(RED));
-                    ui.add(egui::TextEdit::singleline(&mut self.ld_text).hint_text("D:\\LDPlayer\\LDPlayer9").margin(theme::INPUT_MARGIN).desired_width(260.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.ld_text)
+                            .hint_text("D:\\LDPlayer\\LDPlayer9")
+                            .margin(theme::INPUT_MARGIN)
+                            .desired_width(260.0),
+                    );
                     if ui.button("Lưu").clicked() {
                         let dir = PathBuf::from(self.ld_text.trim());
                         if device::is_ldplayer_dir(&dir) {
@@ -458,7 +692,8 @@ impl App {
                             self.settings.save();
                             self.refresh_instances();
                         } else {
-                            self.inst_error = Some("Thư mục này không có ldconsole.exe và adb.exe".into());
+                            self.inst_error =
+                                Some("Thư mục này không có ldconsole.exe và adb.exe".into());
                         }
                     }
                 });
@@ -495,34 +730,51 @@ impl App {
             egui::TopBottomPanel::bottom("detail")
                 .resizable(true)
                 .default_height(320.0)
-                .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::same(16)))
+                .frame(
+                    egui::Frame::new()
+                        .fill(PANEL)
+                        .inner_margin(Margin::same(16)),
+                )
                 .show(ctx, |ui| self.detail_ui(ui, ctx));
         }
 
         let mut actions = Vec::new();
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG).inner_margin(Margin::same(20))).show(ctx, |ui| {
-            self.banners(ui);
-            if self.scenarios.is_empty() {
-                ui.add_space(60.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(RichText::new(ic::LIST_CHECKS).size(48.0).color(MUTED));
-                    ui.label(theme::title("Chưa có kịch bản nào"));
-                    ui.label(theme::muted("Bấm \"Tạo kịch bản\" rồi nhập từng bước bằng tiếng Việt."));
-                });
-                return;
-            }
-            ui.label(theme::title(format!("Kịch bản ({})", self.scenarios.len())));
-            ui.add_space(4.0);
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                let instances = &self.instances;
-                for sc in &mut self.scenarios {
-                    let job = self.jobs.iter().find(|j| j.scenario_id == sc.id && !j.is_finished());
-                    let selected = self.selected.as_deref() == Some(sc.id.as_str());
-                    scenario_card(ui, sc, job, instances, selected, &mut actions);
-                    ui.add_space(8.0);
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG)
+                    .inner_margin(Margin::same(20)),
+            )
+            .show(ctx, |ui| {
+                self.banners(ui);
+                if self.scenarios.is_empty() {
+                    ui.add_space(60.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new(ic::LIST_CHECKS).size(48.0).color(MUTED));
+                        ui.label(theme::title("Chưa có kịch bản nào"));
+                        ui.label(theme::muted(
+                            "Bấm \"Tạo kịch bản\" rồi nhập từng bước bằng tiếng Việt.",
+                        ));
+                    });
+                    return;
                 }
+                ui.label(theme::title(format!("Kịch bản ({})", self.scenarios.len())));
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let instances = &self.instances;
+                        for sc in &mut self.scenarios {
+                            let job = self
+                                .jobs
+                                .iter()
+                                .find(|j| j.scenario_id == sc.id && !j.is_finished());
+                            let selected = self.selected.as_deref() == Some(sc.id.as_str());
+                            scenario_card(ui, sc, job, instances, selected, &mut actions);
+                            ui.add_space(8.0);
+                        }
+                    });
             });
-        });
 
         for a in actions {
             self.apply(a);
@@ -533,7 +785,11 @@ impl App {
     fn apply(&mut self, action: RowAction) {
         match action {
             RowAction::Select(id) => {
-                self.selected = if self.selected.as_deref() == Some(id.as_str()) { None } else { Some(id) };
+                self.selected = if self.selected.as_deref() == Some(id.as_str()) {
+                    None
+                } else {
+                    Some(id)
+                };
                 self.job_screen = ScreenView::default();
             }
             RowAction::Save(id) => {
@@ -542,16 +798,27 @@ impl App {
                 }
             }
             RowAction::Start(id) => {
-                let Some(sc) = self.scenarios.iter().find(|s| s.id == id).cloned() else { return };
+                let Some(sc) = self.scenarios.iter().find(|s| s.id == id).cloned() else {
+                    return;
+                };
                 let Some(ld_dir) = self.settings.ld_dir.clone() else {
                     self.warn("Chưa cấu hình LDPlayer");
                     return;
                 };
-                let Some(inst) = self.instances.iter().find(|i| i.index == sc.instance_index).cloned() else {
+                let Some(inst) = self
+                    .instances
+                    .iter()
+                    .find(|i| i.index == sc.instance_index)
+                    .cloned()
+                else {
                     self.warn("Chọn giả lập cho kịch bản trước");
                     return;
                 };
-                if self.jobs.iter().any(|j| j.instance_index == inst.index && !j.is_finished()) {
+                if self
+                    .jobs
+                    .iter()
+                    .any(|j| j.instance_index == inst.index && !j.is_finished())
+                {
                     self.warn(format!("Giả lập \"{}\" đang chạy kịch bản khác", inst.name));
                     return;
                 }
@@ -577,9 +844,15 @@ impl App {
             }
             RowAction::Delete(id) => self.confirm_delete = Some(id),
             RowAction::Export(id) => {
-                let Some(sc) = self.scenarios.iter().find(|s| s.id == id) else { return };
+                let Some(sc) = self.scenarios.iter().find(|s| s.id == id) else {
+                    return;
+                };
                 let file_name = format!("{}.omnipilot", sanitize_file_name(&sc.name));
-                let Some(path) = rfd::FileDialog::new().add_filter("Kịch bản OmniPilot", &["omnipilot"]).set_file_name(file_name).save_file() else {
+                let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Kịch bản OmniPilot", &["omnipilot"])
+                    .set_file_name(file_name)
+                    .save_file()
+                else {
                     return;
                 };
                 match sc.export(&path) {
@@ -591,53 +864,93 @@ impl App {
     }
 
     fn import_dialog(&mut self) {
-        let Some(path) = rfd::FileDialog::new().add_filter("Kịch bản OmniPilot", &["omnipilot"]).pick_file() else { return };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Kịch bản OmniPilot", &["omnipilot"])
+            .pick_file()
+        else {
+            return;
+        };
         match Scenario::import(&path) {
             Ok(mut sc) => {
                 // Point it at a local emulator; the sharer's instance index means nothing here.
-                if let Some(i) = self.instances.iter().find(|i| i.running).or(self.instances.first()) {
+                if let Some(i) = self
+                    .instances
+                    .iter()
+                    .find(|i| i.running)
+                    .or(self.instances.first())
+                {
                     sc.instance_index = i.index;
                     let _ = sc.save();
                 }
-                match self.instances.iter().find(|i| i.index == sc.instance_index).and_then(|i| size_warning(&sc, i)) {
+                match self
+                    .instances
+                    .iter()
+                    .find(|i| i.index == sc.instance_index)
+                    .and_then(|i| size_warning(&sc, i))
+                {
                     Some(w) => self.warn(format!("Đã nhập \"{}\". {w}", sc.name)),
-                    None => self.info(format!("Đã nhập \"{}\". Chọn giả lập rồi bấm Chạy.", sc.name)),
+                    None => self.info(format!(
+                        "Đã nhập \"{}\". Chọn giả lập rồi bấm Chạy.",
+                        sc.name
+                    )),
                 }
                 self.selected = Some(sc.id.clone());
                 self.scenarios.push(sc);
-                self.scenarios.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                self.scenarios
+                    .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
             }
             Err(e) => self.warn(format!("Nhập thất bại: {e:#}")),
         }
     }
 
     fn delete_dialog(&mut self, ctx: &egui::Context) {
-        let Some(id) = self.confirm_delete.clone() else { return };
-        let name = self.scenarios.iter().find(|s| s.id == id).map(|s| s.name.clone()).unwrap_or_default();
-        egui::Window::new("Xóa kịch bản").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-            ui.label(format!("Xóa kịch bản \"{name}\"? Không thể hoàn tác."));
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.add(theme::button(format!("{} Xóa", ic::TRASH), RED)).clicked() {
-                    if let Some(sc) = self.scenarios.iter().find(|s| s.id == id) {
-                        sc.delete();
+        let Some(id) = self.confirm_delete.clone() else {
+            return;
+        };
+        let name = self
+            .scenarios
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        egui::Window::new("Xóa kịch bản")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("Xóa kịch bản \"{name}\"? Không thể hoàn tác."));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(theme::button(format!("{} Xóa", ic::TRASH), RED))
+                        .clicked()
+                    {
+                        if let Some(sc) = self.scenarios.iter().find(|s| s.id == id) {
+                            sc.delete();
+                        }
+                        self.scenarios.retain(|s| s.id != id);
+                        if self.selected.as_deref() == Some(id.as_str()) {
+                            self.selected = None;
+                        }
+                        self.confirm_delete = None;
                     }
-                    self.scenarios.retain(|s| s.id != id);
-                    if self.selected.as_deref() == Some(id.as_str()) {
-                        self.selected = None;
+                    if ui.button("Hủy").clicked() {
+                        self.confirm_delete = None;
                     }
-                    self.confirm_delete = None;
-                }
-                if ui.button("Hủy").clicked() {
-                    self.confirm_delete = None;
-                }
+                });
             });
-        });
     }
 
     fn detail_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let Some(id) = self.selected.clone() else { return };
-        let name = self.scenarios.iter().find(|s| s.id == id).map(|s| s.name.clone()).unwrap_or_default();
+        let Some(id) = self.selected.clone() else {
+            return;
+        };
+        let name = self
+            .scenarios
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
         ui.horizontal(|ui| {
             ui.label(theme::title(format!("{} {name}", ic::TERMINAL_WINDOW)));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -647,7 +960,9 @@ impl App {
             });
         });
         let Some(job) = self.jobs.iter().rev().find(|j| j.scenario_id == id) else {
-            ui.label(theme::muted("Kịch bản này chưa chạy lần nào kể từ khi mở app. Bấm Chạy để bắt đầu."));
+            ui.label(theme::muted(
+                "Kịch bản này chưa chạy lần nào kể từ khi mở app. Bấm Chạy để bắt đầu.",
+            ));
             return;
         };
         if job.screen_gen != self.job_screen.shown_gen {
@@ -659,7 +974,7 @@ impl App {
         ui.columns(2, |cols| {
             cols[0].label(theme::muted(format!("Số lượt đã xong: {}", job.runs)));
             log_ui(&mut cols[0], &job.log);
-            self.job_screen.ui(&mut cols[1]);
+            self.job_screen.ui(&mut cols[1], None, false);
         });
     }
 
@@ -671,57 +986,115 @@ impl App {
         ed.poll(ctx);
         let busy = ed.task.is_some();
 
-        egui::TopBottomPanel::top("ed_top").frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(20, 14))).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if ui.add_enabled(!busy, egui::Button::new(format!("{} Quay lại", ic::ARROW_LEFT))).clicked() {
-                    close = Some(false);
-                }
-                ui.add_space(8.0);
-                ui.label(RichText::new(if ed.is_new { "Tạo kịch bản" } else { "Sửa kịch bản" }).family(theme::bold()).size(20.0));
-            });
-        });
-
-        // Action bar.
-        egui::TopBottomPanel::bottom("ed_actions").frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(20, 12))).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let inst = instances.iter().find(|i| i.index == ed.sc.instance_index).cloned();
-                let has_steps = script::leaf_count(&ed.sc.steps) > 0 && ed.sc.steps.iter().any(|n| n.is_loop() || !n.text.trim().is_empty());
-                if let Some(t) = &ed.task {
-                    if ui.add(theme::button(format!("{} Dừng", ic::STOP), RED)).clicked() {
-                        t.stop.store(true, Ordering::Relaxed);
+        egui::TopBottomPanel::top("ed_top")
+            .frame(
+                egui::Frame::new()
+                    .fill(PANEL)
+                    .inner_margin(Margin::symmetric(20, 14)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !busy,
+                            egui::Button::new(format!("{} Quay lại", ic::ARROW_LEFT)),
+                        )
+                        .clicked()
+                    {
+                        close = Some(false);
                     }
-                    ui.spinner();
-                    ui.label(t.label);
-                } else {
-                    let can_trial = has_steps && ld_dir.is_some() && inst.is_some();
-                    let btn = ui.add_enabled(can_trial, theme::button(format!("{} Chạy thử", ic::PLAY), ACCENT));
-                    let btn = if inst.is_none() { btn.on_disabled_hover_text("Chọn giả lập trước") } else { btn };
-                    if btn.clicked() {
-                        ed.start_trial(ld_dir.clone().unwrap(), inst.clone().unwrap());
-                    }
-                    if ui.add_enabled(has_steps, egui::Button::new(format!("{} Xem AI hiểu thế nào", ic::BRAIN))).on_hover_text("AI đọc các bước nhưng chưa bấm gì vào game").clicked() {
-                        ed.start_analyse();
-                    }
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let ok = matches!(ed.trial, Some(Ok(())));
-                    let named = !ed.sc.name.trim().is_empty();
-                    let can_save = ok && named && !busy;
-                    let fill = if can_save { Color32::from_rgb(0x16, 0xa3, 0x6f) } else { CARD_HI };
-                    let save = ui.add_enabled(can_save, theme::button(format!("{} Lưu kịch bản", ic::CHECK_CIRCLE), fill));
-                    let save = if !ok {
-                        save.on_disabled_hover_text("Chạy thử thành công rồi mới lưu được")
-                    } else if !named {
-                        save.on_disabled_hover_text("Nhập tên kịch bản trước")
-                    } else {
-                        save
-                    };
-                    if save.clicked() {
-                        close = Some(true);
-                    }
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(if ed.is_new {
+                            "Tạo kịch bản"
+                        } else {
+                            "Sửa kịch bản"
+                        })
+                        .family(theme::bold())
+                        .size(20.0),
+                    );
                 });
             });
-        });
+
+        // Action bar.
+        egui::TopBottomPanel::bottom("ed_actions")
+            .frame(
+                egui::Frame::new()
+                    .fill(PANEL)
+                    .inner_margin(Margin::symmetric(20, 12)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let inst = instances
+                        .iter()
+                        .find(|i| i.index == ed.sc.instance_index)
+                        .cloned();
+                    let has_steps = script::leaf_count(&ed.sc.steps) > 0
+                        && ed
+                            .sc
+                            .steps
+                            .iter()
+                            .any(|n| n.is_loop() || !n.text.trim().is_empty());
+                    if let Some(t) = &ed.task {
+                        if ui
+                            .add(theme::button(format!("{} Dừng", ic::STOP), RED))
+                            .clicked()
+                        {
+                            t.stop.store(true, Ordering::Relaxed);
+                        }
+                        ui.spinner();
+                        ui.label(t.label);
+                    } else {
+                        let can_trial = has_steps && ld_dir.is_some() && inst.is_some();
+                        let btn = ui.add_enabled(
+                            can_trial,
+                            theme::button(format!("{} Chạy thử", ic::PLAY), ACCENT),
+                        );
+                        let btn = if inst.is_none() {
+                            btn.on_disabled_hover_text("Chọn giả lập trước")
+                        } else {
+                            btn
+                        };
+                        if btn.clicked() {
+                            ed.start_trial(ld_dir.clone().unwrap(), inst.clone().unwrap());
+                        }
+                        if ui
+                            .add_enabled(
+                                has_steps,
+                                egui::Button::new(format!("{} Xem AI hiểu thế nào", ic::BRAIN)),
+                            )
+                            .on_hover_text("AI đọc các bước nhưng chưa bấm gì vào game")
+                            .clicked()
+                        {
+                            ed.start_analyse();
+                        }
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let ok = matches!(ed.trial, Some(Ok(())));
+                        let named = !ed.sc.name.trim().is_empty();
+                        let can_save = ok && named && !busy;
+                        let fill = if can_save {
+                            Color32::from_rgb(0x16, 0xa3, 0x6f)
+                        } else {
+                            CARD_HI
+                        };
+                        let save = ui.add_enabled(
+                            can_save,
+                            theme::button(format!("{} Lưu kịch bản", ic::CHECK_CIRCLE), fill),
+                        );
+                        let save = if !ok {
+                            save.on_disabled_hover_text("Chạy thử thành công rồi mới lưu được")
+                        } else if !named {
+                            save.on_disabled_hover_text("Nhập tên kịch bản trước")
+                        } else {
+                            save
+                        };
+                        if save.clicked() {
+                            close = Some(true);
+                        }
+                    });
+                });
+            });
 
         egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG).inner_margin(Margin::same(20))).show(ctx, |ui| {
             ui.columns(2, |cols| {
@@ -752,9 +1125,18 @@ impl App {
                             ui.label(theme::title(format!("{} Các bước", ic::LIST_NUMBERS)));
                             ui.label(theme::muted("Mỗi ô là một bước, viết như nói chuyện. vd: \"bấm xuất chiến góc phải dưới\", \"chọn ải mới nhất\", \"đợi đánh xong\", \"chờ 3 giây\"."));
                             ui.add_space(6.0);
-                            let mut changed = false;
-                            let mut counter = 0;
-                            nodes_ui(ui, &mut ed.sc.steps, false, &mut counter, &mut changed);
+                            let mut st = StepsUi { counter: 0, changed: false, picking: ed.picking.as_deref(), pick_request: None };
+                            nodes_ui(ui, &mut ed.sc.steps, &mut Vec::new(), &mut st);
+                            let (mut changed, pick_request) = (st.changed, st.pick_request);
+                            if let Some(path) = pick_request {
+                                // Clicking "Vùng tìm" again cancels.
+                                ed.picking = if ed.picking.as_ref() == Some(&path) { None } else { Some(path) };
+                                if ed.picking.is_some() && ed.screen.tex.is_none() {
+                                    if let (Some(ld), Some(inst)) = (&ld_dir, instances.iter().find(|i| i.index == ed.sc.instance_index)) {
+                                        ed.capture(ld.clone(), inst.clone());
+                                    }
+                                }
+                            }
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
                                 if ui.button(format!("{} Thêm bước", ic::PLUS)).clicked() {
@@ -814,9 +1196,45 @@ impl App {
                 let ui = &mut cols[1];
                 theme::card(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.label(theme::title(format!("{} Màn hình giả lập", ic::MONITOR)));
+                    ui.horizontal(|ui| {
+                        ui.label(theme::title(format!("{} Màn hình giả lập", ic::MONITOR)));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let inst = instances.iter().find(|i| i.index == ed.sc.instance_index);
+                            let can = !busy && ed.shot_rx.is_none() && ld_dir.is_some() && inst.is_some();
+                            if ui.add_enabled(can, egui::Button::new(format!("{} Chụp màn hình", ic::CAMERA))).on_hover_text("Lấy màn hình hiện tại của giả lập").clicked() {
+                                ed.capture(ld_dir.clone().unwrap(), inst.cloned().unwrap());
+                            }
+                            if ed.shot_rx.is_some() {
+                                ui.spinner();
+                            }
+                        });
+                    });
                     ui.add_space(4.0);
-                    ed.screen.ui(ui);
+                    let picking = ed.picking.clone();
+                    let region = picking.as_ref().and_then(|p| node_at(&mut ed.sc.steps, p)).and_then(|n| n.region);
+                    if picking.is_some() {
+                        theme::card_frame(YELLOW.gamma_multiply(0.6)).inner_margin(Margin::same(10)).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let text = format!("{} Kéo chuột trên ảnh để khoanh vùng AI được tìm cho bước này", ic::SELECTION);
+                                let text_width = ui.available_width() - 60.0; // room for "Hủy"
+                                ui.scope(|ui| {
+                                    ui.set_max_width(text_width);
+                                    ui.add(egui::Label::new(RichText::new(text).color(YELLOW)).wrap());
+                                });
+                                if ui.small_button("Hủy").clicked() {
+                                    ed.picking = None;
+                                }
+                            });
+                        });
+                        ui.add_space(6.0);
+                    }
+                    if let Some(new_region) = ed.screen.ui(ui, region, picking.is_some()) {
+                        if let Some(node) = picking.as_ref().and_then(|p| node_at(&mut ed.sc.steps, p)) {
+                            node.region = Some(new_region);
+                            ed.trial = None;
+                        }
+                        ed.picking = None;
+                    }
                 });
                 ui.add_space(12.0);
                 theme::card(ui, |ui| {
@@ -840,8 +1258,12 @@ impl App {
                             Some(s) => *s = sc,
                             None => self.scenarios.push(sc),
                         }
-                        self.scenarios.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-                        self.info(format!("Đã lưu \"{}\". Chọn giả lập rồi bấm Chạy.", ed.sc.name));
+                        self.scenarios
+                            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                        self.info(format!(
+                            "Đã lưu \"{}\". Chọn giả lập rồi bấm Chạy.",
+                            ed.sc.name
+                        ));
                     }
                     Err(e) => self.warn(format!("Lưu thất bại: {e:#}")),
                 }
@@ -860,16 +1282,17 @@ fn demo_scenario(instances: &[Instance]) -> Scenario {
     if let Some(i) = instances.iter().find(|i| i.running) {
         sc.instance_index = i.index;
     }
-    let node = |t: &str| Node { text: t.into(), step: None };
+    let node = Node::with_text;
+    let mut pick = node("tìm phó bản không có chữ \"Hoàn toàn thu hồi\" click vào");
+    pick.otherwise = Some(Box::new(node(
+        "click mũi tên màu xanh góc phải để chuyển trang",
+    )));
+    pick.region = Some([0.27, 0.1, 0.97, 0.95]);
     let mut lp = Node::new_loop();
     if let Some(Step::Loop { steps, .. }) = &mut lp.step {
-        *steps = vec![node("chọn ải mới nhất"), node("bấm tấn công"), node("đợi đánh xong"), node("bấm tiếp tục")];
+        *steps = vec![pick, node("bấm tấn công"), node("đợi đánh xong")];
     }
-    sc.steps = vec![
-        node("bấm xuất chiến góc phải dưới, nếu có bảng thông báo sự kiện hiện ra thì đóng nó trước rồi mới bấm xuất chiến"),
-        lp,
-        node("thoát ra"),
-    ];
+    sc.steps = vec![node("bấm xuất chiến góc phải dưới"), lp, node("thoát ra")];
     sc
 }
 
@@ -878,13 +1301,26 @@ fn schedule_ui(ui: &mut egui::Ui, ed: &mut Editor) {
     let daily = matches!(ed.sc.schedule, Schedule::Daily { .. });
     let once = ed.sc.schedule == Schedule::Once;
     ui.horizontal(|ui| {
-        if ui.selectable_label(repeat, format!("{} Lặp lại liên tục", ic::REPEAT)).clicked() {
-            ed.sc.schedule = Schedule::Repeat { pause_minutes: ed.pause_text.trim().parse().unwrap_or(0) };
+        if ui
+            .selectable_label(repeat, format!("{} Lặp lại liên tục", ic::REPEAT))
+            .clicked()
+        {
+            ed.sc.schedule = Schedule::Repeat {
+                pause_minutes: ed.pause_text.trim().parse().unwrap_or(0),
+            };
         }
-        if ui.selectable_label(daily, format!("{} Chạy theo giờ", ic::CLOCK)).clicked() {
-            ed.sc.schedule = Schedule::Daily { times: jobs::parse_times(&ed.times_text) };
+        if ui
+            .selectable_label(daily, format!("{} Chạy theo giờ", ic::CLOCK))
+            .clicked()
+        {
+            ed.sc.schedule = Schedule::Daily {
+                times: jobs::parse_times(&ed.times_text),
+            };
         }
-        if ui.selectable_label(once, format!("{} Chạy 1 lần", ic::PLAY_CIRCLE)).clicked() {
+        if ui
+            .selectable_label(once, format!("{} Chạy 1 lần", ic::PLAY_CIRCLE))
+            .clicked()
+        {
             ed.sc.schedule = Schedule::Once;
         }
     });
@@ -892,7 +1328,14 @@ fn schedule_ui(ui: &mut egui::Ui, ed: &mut Editor) {
         Schedule::Repeat { pause_minutes } => {
             ui.horizontal(|ui| {
                 ui.label(theme::muted("Nghỉ giữa các lượt"));
-                if ui.add(egui::TextEdit::singleline(&mut ed.pause_text).margin(theme::INPUT_MARGIN).desired_width(48.0)).changed() {
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut ed.pause_text)
+                            .margin(theme::INPUT_MARGIN)
+                            .desired_width(48.0),
+                    )
+                    .changed()
+                {
                     *pause_minutes = ed.pause_text.trim().parse().unwrap_or(0);
                 }
                 ui.label(theme::muted("phút (0 = chạy liên tục)"));
@@ -901,7 +1344,15 @@ fn schedule_ui(ui: &mut egui::Ui, ed: &mut Editor) {
         Schedule::Daily { times } => {
             ui.horizontal(|ui| {
                 ui.label(theme::muted("Giờ chạy"));
-                if ui.add(egui::TextEdit::singleline(&mut ed.times_text).hint_text("08:00, 20:30").margin(theme::INPUT_MARGIN).desired_width(180.0)).changed() {
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut ed.times_text)
+                            .hint_text("08:00, 20:30")
+                            .margin(theme::INPUT_MARGIN)
+                            .desired_width(180.0),
+                    )
+                    .changed()
+                {
                     *times = jobs::parse_times(&ed.times_text);
                 }
             });
@@ -910,7 +1361,9 @@ fn schedule_ui(ui: &mut egui::Ui, ed: &mut Editor) {
             }
         }
         Schedule::Once => {
-            ui.label(theme::muted("Bấm Chạy là chạy hết các bước đúng một lần rồi tự dừng."));
+            ui.label(theme::muted(
+                "Bấm Chạy là chạy hết các bước đúng một lần rồi tự dừng.",
+            ));
         }
     }
 }
@@ -921,19 +1374,101 @@ enum NodeAction {
     Remove(usize),
 }
 
+/// State shared while drawing the (nested) step list.
+struct StepsUi<'a> {
+    /// Running step number shown in the badges.
+    counter: usize,
+    changed: bool,
+    /// Path (indices through loops) of the step whose search area is being picked.
+    picking: Option<&'a [usize]>,
+    /// Set when the user clicks "Vùng tìm" on a step.
+    pick_request: Option<Vec<usize>>,
+}
+
+/// Finds a node by its path of indices through loops.
+fn node_at<'a>(nodes: &'a mut [Node], path: &[usize]) -> Option<&'a mut Node> {
+    let (first, rest) = path.split_first()?;
+    let node = nodes.get_mut(*first)?;
+    if rest.is_empty() {
+        return Some(node);
+    }
+    match &mut node.step {
+        Some(Step::Loop { steps, .. }) => node_at(steps, rest),
+        _ => None,
+    }
+}
+
+/// A growing, height-draggable text area for one step.
+fn step_text_box(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash,
+    text: &mut String,
+    hint: &str,
+) -> bool {
+    let w = ui.available_width();
+    let mut changed = false;
+    egui::Resize::default()
+        .id_salt(id)
+        .resizable([false, true])
+        .with_stroke(false)
+        .min_width(w)
+        .max_width(w)
+        .default_size(vec2(w, 40.0))
+        .min_height(40.0)
+        .max_height(300.0)
+        .show(ui, |ui| {
+            let edit = egui::TextEdit::multiline(text)
+                .hint_text(hint)
+                .margin(theme::INPUT_MARGIN)
+                .desired_rows(1)
+                .desired_width(w);
+            changed = ui.add_sized(ui.available_size(), edit).changed();
+        });
+    changed
+}
+
+/// One line telling how the AI understood a step.
+fn interpretation(ui: &mut egui::Ui, node: &Node, indent: f32) {
+    let (text, color) = match &node.step {
+        Some(s @ Step::Tap { dynamic: true, .. }) => {
+            (format!("{} {}", ic::LIGHTNING, s.describe()), YELLOW)
+        }
+        Some(s) => (
+            format!("{} {}", ic::ARROW_BEND_DOWN_RIGHT, s.describe()),
+            GREEN,
+        ),
+        None if node.text.trim().is_empty() => return,
+        None => ("AI chưa đọc bước này".to_string(), MUTED),
+    };
+    ui.horizontal(|ui| {
+        ui.add_space(indent);
+        ui.add(egui::Label::new(RichText::new(text).size(12.5).color(color)).wrap());
+    });
+}
+
 /// Editable list of steps; loops render as nested blocks.
-fn nodes_ui(ui: &mut egui::Ui, nodes: &mut Vec<Node>, in_loop: bool, counter: &mut usize, changed: &mut bool) {
+fn nodes_ui(ui: &mut egui::Ui, nodes: &mut Vec<Node>, path: &mut Vec<usize>, st: &mut StepsUi) {
     let mut action = None;
     let len = nodes.len();
+    let in_loop = !path.is_empty();
     for (i, node) in nodes.iter_mut().enumerate() {
+        path.push(i);
         let row_buttons = |ui: &mut egui::Ui, action: &mut Option<NodeAction>| {
             if ui.small_button(ic::TRASH).on_hover_text("Xóa").clicked() {
                 *action = Some(NodeAction::Remove(i));
             }
-            if ui.add_enabled(i + 1 < len, egui::Button::new(ic::ARROW_DOWN).small()).on_hover_text("Chuyển xuống").clicked() {
+            if ui
+                .add_enabled(i + 1 < len, egui::Button::new(ic::ARROW_DOWN).small())
+                .on_hover_text("Chuyển xuống")
+                .clicked()
+            {
                 *action = Some(NodeAction::Down(i));
             }
-            if ui.add_enabled(i > 0, egui::Button::new(ic::ARROW_UP).small()).on_hover_text("Chuyển lên").clicked() {
+            if ui
+                .add_enabled(i > 0, egui::Button::new(ic::ARROW_UP).small())
+                .on_hover_text("Chuyển lên")
+                .clicked()
+            {
                 *action = Some(NodeAction::Up(i));
             }
         };
@@ -946,67 +1481,170 @@ fn nodes_ui(ui: &mut egui::Ui, nodes: &mut Vec<Node>, in_loop: bool, counter: &m
                 .inner_margin(Margin::same(12))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("{} Lặp lại tối đa", ic::REPEAT)).color(ACCENT).family(theme::bold()));
+                        ui.label(
+                            RichText::new(format!("{} Lặp lại tối đa", ic::REPEAT))
+                                .color(ACCENT)
+                                .family(theme::bold()),
+                        );
                         if ui.add(egui::DragValue::new(max).range(1..=999)).changed() {
-                            *changed = true;
+                            st.changed = true;
                         }
                         ui.label(RichText::new("lần").color(ACCENT).family(theme::bold()));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| row_buttons(ui, &mut action));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            row_buttons(ui, &mut action)
+                        });
                     });
-                    ui.label(RichText::new("Tự dừng khi một bước bên trong không tìm thấy nút (vd hết map).").size(12.5).color(MUTED));
+                    ui.label(
+                        RichText::new(
+                            "Tự dừng khi một bước bên trong không tìm thấy nút (vd hết map).",
+                        )
+                        .size(12.5)
+                        .color(MUTED),
+                    );
                     ui.add_space(4.0);
-                    nodes_ui(ui, steps, true, counter, changed);
-                    if ui.button(format!("{} Thêm bước vào vòng lặp", ic::PLUS)).clicked() {
+                    nodes_ui(ui, steps, path, st);
+                    if ui
+                        .button(format!("{} Thêm bước vào vòng lặp", ic::PLUS))
+                        .clicked()
+                    {
                         steps.push(Node::new());
-                        *changed = true;
+                        st.changed = true;
                     }
                 });
             ui.add_space(4.0);
+            path.pop();
             continue;
         }
 
-        *counter += 1;
+        st.counter += 1;
+        let number = st.counter;
         ui.horizontal_top(|ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(26.0, 38.0), egui::Sense::hover());
-            ui.painter().circle_filled(rect.center(), 12.0, if node.step.is_some() { ACCENT.gamma_multiply(0.35) } else { BORDER });
-            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, counter.to_string(), egui::FontId::new(13.0, theme::bold()), TEXT);
+            ui.painter().circle_filled(
+                rect.center(),
+                12.0,
+                if node.step.is_some() {
+                    ACCENT.gamma_multiply(0.35)
+                } else {
+                    BORDER
+                },
+            );
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                number.to_string(),
+                egui::FontId::new(13.0, theme::bold()),
+                TEXT,
+            );
             // Buttons first (right to left) so the text box takes exactly what is left.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                 row_buttons(ui, &mut action);
-                let w = ui.available_width();
-                let hint = if in_loop { "vd: chọn ải mới nhất" } else { "vd: bấm xuất chiến góc phải dưới" };
-                // Text area: wraps and grows with the text, and its height can be dragged
-                // from the bottom-right corner.
-                egui::Resize::default()
-                    .id_salt(("step-box", *counter))
-                    .resizable([false, true])
-                    .with_stroke(false)
-                    .min_width(w)
-                    .max_width(w)
-                    .default_size(vec2(w, 40.0))
-                    .min_height(40.0)
-                    .max_height(300.0)
-                    .show(ui, |ui| {
-                        let edit = egui::TextEdit::multiline(&mut node.text).hint_text(hint).margin(theme::INPUT_MARGIN).desired_rows(1).desired_width(w);
-                        if ui.add_sized(ui.available_size(), edit).changed() {
-                            node.step = None;
-                            *changed = true;
-                        }
-                    });
+                let hint = if in_loop {
+                    "vd: chọn ải mới nhất"
+                } else {
+                    "vd: bấm xuất chiến góc phải dưới"
+                };
+                if step_text_box(ui, ("step-box", number), &mut node.text, hint) {
+                    node.step = None;
+                    st.changed = true;
+                }
             });
         });
-        let (text, color) = match &node.step {
-            Some(s @ Step::Tap { dynamic: true, .. }) => (format!("{} {}", ic::LIGHTNING, s.describe()), YELLOW),
-            Some(s) => (format!("{} {}", ic::ARROW_BEND_DOWN_RIGHT, s.describe()), GREEN),
-            None if node.text.trim().is_empty() => (String::new(), MUTED),
-            None => ("AI chưa đọc bước này".to_string(), MUTED),
-        };
-        if !text.is_empty() {
-            ui.horizontal(|ui| {
-                ui.add_space(34.0);
-                ui.label(RichText::new(text).size(12.5).color(color));
+        interpretation(ui, node, 34.0);
+
+        // Extras: search area and "nếu không thấy thì…".
+        ui.horizontal(|ui| {
+            ui.add_space(30.0);
+            let picking_this = st.picking == Some(path.as_slice());
+            let label = match (picking_this, node.region.is_some()) {
+                (true, _) => format!("{} Đang chọn vùng…", ic::SELECTION),
+                (false, true) => format!("{} Vùng tìm ✓", ic::SELECTION),
+                (false, false) => format!("{} Vùng tìm", ic::SELECTION),
+            };
+            let tip = "Kéo chuột trên ảnh màn hình để AI chỉ tìm trong vùng đó (tránh nhầm với chỗ khác)";
+            let selected = picking_this || node.region.is_some();
+            if ui.add(egui::Button::new(RichText::new(label).size(13.0)).small().selected(selected)).on_hover_text(tip).clicked() {
+                st.pick_request = Some(path.clone());
+            }
+            if node.region.is_some() && ui.small_button(ic::X).on_hover_text("Bỏ vùng tìm (tìm cả màn hình)").clicked() {
+                node.region = None;
+                st.changed = true;
+            }
+            if node.otherwise.is_none() {
+                let btn = egui::Button::new(RichText::new(format!("{} Nếu không thấy thì…", ic::ARROW_ELBOW_DOWN_RIGHT)).size(13.0)).small();
+                if ui.add(btn).on_hover_text("Làm một việc khác khi không tìm thấy (vd bấm mũi tên sang trang) rồi tìm lại").clicked() {
+                    node.otherwise = Some(Box::new(Node::new()));
+                    st.changed = true;
+                }
+            }
+        });
+
+        let mut remove_otherwise = false;
+        if let Some(other) = node.otherwise.as_deref_mut() {
+            ui.horizontal_top(|ui| {
+                ui.add_space(30.0);
+                let width = ui.available_width() - 20.0; // minus the frame's inner margin
+                egui::Frame::new()
+                    .fill(theme::INPUT.gamma_multiply(0.6))
+                    .corner_radius(8)
+                    .inner_margin(Margin::same(10))
+                    .show(ui, |ui| {
+                        // The parent row is horizontal; lay the block out top to bottom.
+                        ui.vertical(|ui| {
+                            ui.set_width(width);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} Nếu không thấy thì",
+                                        ic::ARROW_ELBOW_DOWN_RIGHT
+                                    ))
+                                    .color(ACCENT)
+                                    .family(theme::bold())
+                                    .size(13.5),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.small_button(ic::X).on_hover_text("Bỏ").clicked() {
+                                            remove_otherwise = true;
+                                        }
+                                    },
+                                );
+                            });
+                            if step_text_box(
+                                ui,
+                                ("otherwise-box", number),
+                                &mut other.text,
+                                "vd: bấm mũi tên màu xanh góc phải để sang trang",
+                            ) {
+                                other.step = None;
+                                st.changed = true;
+                            }
+                            interpretation(ui, other, 0.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("rồi tìm lại, tối đa").size(13.0).color(MUTED),
+                                );
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut node.otherwise_max).range(1..=99),
+                                    )
+                                    .changed()
+                                {
+                                    st.changed = true;
+                                }
+                                ui.label(RichText::new("lần").size(13.0).color(MUTED));
+                            });
+                        });
+                    });
             });
         }
+        if remove_otherwise {
+            node.otherwise = None;
+            st.changed = true;
+        }
+        ui.add_space(6.0);
+        path.pop();
     }
     match action {
         Some(NodeAction::Up(i)) => nodes.swap(i, i - 1),
@@ -1016,10 +1654,17 @@ fn nodes_ui(ui: &mut egui::Ui, nodes: &mut Vec<Node>, in_loop: bool, counter: &m
         }
         None => return,
     }
-    *changed = true;
+    st.changed = true;
 }
 
-fn scenario_card(ui: &mut egui::Ui, sc: &mut Scenario, job: Option<&Job>, instances: &[Instance], selected: bool, actions: &mut Vec<RowAction>) {
+fn scenario_card(
+    ui: &mut egui::Ui,
+    sc: &mut Scenario,
+    job: Option<&Job>,
+    instances: &[Instance],
+    selected: bool,
+    actions: &mut Vec<RowAction>,
+) {
     let running = job.is_some();
     let border = if selected { ACCENT } else { BORDER };
     let resp = theme::card_frame(border).show(ui, |ui| {
@@ -1046,7 +1691,10 @@ fn scenario_card(ui: &mut egui::Ui, sc: &mut Scenario, job: Option<&Job>, instan
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if running {
-                    if ui.add(theme::button(format!("{} Dừng", ic::STOP), RED)).clicked() {
+                    if ui
+                        .add(theme::button(format!("{} Dừng", ic::STOP), RED))
+                        .clicked()
+                    {
                         actions.push(RowAction::Stop(sc.id.clone()));
                     }
                 } else {
@@ -1055,30 +1703,54 @@ fn scenario_card(ui: &mut egui::Ui, sc: &mut Scenario, job: Option<&Job>, instan
                             actions.push(RowAction::Edit(sc.id.clone()));
                             ui.close();
                         }
-                        if ui.add_enabled(sc.recorded, egui::Button::new(format!("{} Xuất file chia sẻ", ic::UPLOAD_SIMPLE))).clicked() {
+                        if ui
+                            .add_enabled(
+                                sc.recorded,
+                                egui::Button::new(format!(
+                                    "{} Xuất file chia sẻ",
+                                    ic::UPLOAD_SIMPLE
+                                )),
+                            )
+                            .clicked()
+                        {
                             actions.push(RowAction::Export(sc.id.clone()));
                             ui.close();
                         }
-                        if ui.button(RichText::new(format!("{} Xóa", ic::TRASH)).color(RED)).clicked() {
+                        if ui
+                            .button(RichText::new(format!("{} Xóa", ic::TRASH)).color(RED))
+                            .clicked()
+                        {
                             actions.push(RowAction::Delete(sc.id.clone()));
                             ui.close();
                         }
                     });
-                    if ui.add(theme::button(format!("{} Chạy", ic::PLAY), ACCENT)).clicked() {
+                    if ui
+                        .add(theme::button(format!("{} Chạy", ic::PLAY), ACCENT))
+                        .clicked()
+                    {
                         actions.push(RowAction::Start(sc.id.clone()));
                     }
                 }
                 ui.add_space(8.0);
                 ui.add_enabled_ui(!running, |ui| {
                     let current = instances.iter().find(|i| i.index == sc.instance_index);
-                    let text = current.map(|i| i.name.clone()).unwrap_or_else(|| format!("#{}", sc.instance_index));
+                    let text = current
+                        .map(|i| i.name.clone())
+                        .unwrap_or_else(|| format!("#{}", sc.instance_index));
                     let before = sc.instance_index;
-                    egui::ComboBox::from_id_salt(("inst", sc.id.as_str())).selected_text(format!("{}  {text}", ic::DEVICE_MOBILE)).width(220.0).show_ui(ui, |ui| {
-                        for inst in instances {
-                            let label = format!("{}{}", inst.name, if inst.running { "  ● đang mở" } else { "" });
-                            ui.selectable_value(&mut sc.instance_index, inst.index, label);
-                        }
-                    });
+                    egui::ComboBox::from_id_salt(("inst", sc.id.as_str()))
+                        .selected_text(format!("{}  {text}", ic::DEVICE_MOBILE))
+                        .width(220.0)
+                        .show_ui(ui, |ui| {
+                            for inst in instances {
+                                let label = format!(
+                                    "{}{}",
+                                    inst.name,
+                                    if inst.running { "  ● đang mở" } else { "" }
+                                );
+                                ui.selectable_value(&mut sc.instance_index, inst.index, label);
+                            }
+                        });
                     if sc.instance_index != before {
                         actions.push(RowAction::Save(sc.id.clone()));
                     }
@@ -1103,21 +1775,37 @@ fn scenario_card(ui: &mut egui::Ui, sc: &mut Scenario, job: Option<&Job>, instan
 }
 
 fn sanitize_file_name(name: &str) -> String {
-    let s: String = name.chars().map(|c| if r#"\/:*?"<>|"#.contains(c) { '_' } else { c }).collect();
-    if s.trim().is_empty() { "kich-ban".into() } else { s.trim().to_string() }
+    let s: String = name
+        .chars()
+        .map(|c| if r#"\/:*?"<>|"#.contains(c) { '_' } else { c })
+        .collect();
+    if s.trim().is_empty() {
+        "kich-ban".into()
+    } else {
+        s.trim().to_string()
+    }
 }
 
 fn log_ui(ui: &mut egui::Ui, log: &[String]) {
-    egui::Frame::new().fill(theme::INPUT).corner_radius(8).inner_margin(Margin::same(10)).show(ui, |ui| {
-        egui::ScrollArea::vertical().id_salt("log").stick_to_bottom(true).auto_shrink([false, false]).max_height(260.0).show(ui, |ui| {
-            if log.is_empty() {
-                ui.label(theme::muted("(chưa có gì)"));
-            }
-            for line in log {
-                ui.label(RichText::new(line).monospace().size(12.5).color(TEXT));
-            }
+    egui::Frame::new()
+        .fill(theme::INPUT)
+        .corner_radius(8)
+        .inner_margin(Margin::same(10))
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("log")
+                .stick_to_bottom(true)
+                .auto_shrink([false, false])
+                .max_height(260.0)
+                .show(ui, |ui| {
+                    if log.is_empty() {
+                        ui.label(theme::muted("(chưa có gì)"));
+                    }
+                    for line in log {
+                        ui.label(RichText::new(line).monospace().size(12.5).color(TEXT));
+                    }
+                });
         });
-    });
 }
 
 impl eframe::App for App {

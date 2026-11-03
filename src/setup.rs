@@ -93,7 +93,12 @@ fn run(progress: &SharedProgress) -> Result<()> {
     for (i, asset) in list.into_iter().enumerate() {
         {
             let mut p = progress.lock().unwrap();
-            *p = Progress { label: asset.label.to_string(), step: i + 1, total_steps: total, ..Default::default() };
+            *p = Progress {
+                label: asset.label.to_string(),
+                step: i + 1,
+                total_steps: total,
+                ..Default::default()
+            };
         }
         let already = match &asset.extract_to {
             Some(dir) => dir.join("llama-server.exe").exists(),
@@ -102,7 +107,8 @@ fn run(progress: &SharedProgress) -> Result<()> {
         if already {
             continue;
         }
-        download(&asset.url, &asset.dest, progress).with_context(|| format!("tải {} thất bại", asset.label))?;
+        download(&asset.url, &asset.dest, progress)
+            .with_context(|| format!("tải {} thất bại", asset.label))?;
         if let Some(dir) = &asset.extract_to {
             extract_zip(&asset.dest, dir)?;
             fs::remove_file(&asset.dest).ok();

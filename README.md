@@ -21,6 +21,8 @@ Không cần cắt ảnh nút, không cần ghi tọa độ. AI chạy ngay trê
    - Chọn kiểu chạy: **Lặp lại liên tục** (có thể nghỉ X phút giữa các lượt), **Chạy theo giờ** (vd `08:00, 20:30` để tranh tài nguyên, làm nhiệm vụ hằng ngày) hoặc **Chạy 1 lần** (chạy hết các bước một lượt rồi tự dừng).
    - **Thêm bước**: mỗi ô là một bước, viết như nói chuyện ("bấm xuất chiến góc phải dưới", "đợi đánh xong", "chờ 3 giây", "nhận hết quà", "thoát ra").
    - **Thêm vòng lặp**: lặp một nhóm bước (vd đánh hết các map). Vòng lặp tự dừng khi một bước bên trong không tìm thấy nút.
+   - Điều kiện và trường hợp không thấy, viết luôn trong câu: *"tìm phó bản không có chữ "Hoàn toàn thu hồi" click vào, nếu không có thì click mũi tên màu xanh góc phải để chuyển trang"*. App giữ nguyên câu khi tìm, tự đọc chữ để loại các ô có chữ cấm, và tách phần "nếu không có thì…" thành mục **Nếu không thấy thì** (làm việc đó rồi tìm lại, tối đa N lần).
+   - **Vùng tìm**: kéo chuột trên ảnh màn hình để AI chỉ tìm trong vùng đó, tránh nhầm với chỗ khác (vd tab bên cạnh bản đồ).
    - **Xem AI hiểu thế nào** (tùy chọn): AI đọc từng bước, hiện cách hiểu bên dưới mỗi ô, chưa bấm gì vào game.
    - **Chạy thử**: AI chạy thật trên giả lập, bạn xem màn hình và nhật ký ngay trong app. Lần này chậm vì AI phải nhìn từng màn hình.
    - Chạy đúng → **Lưu kịch bản**. AI tắt, giải phóng RAM.
@@ -60,6 +62,8 @@ File chạy: `target/release/omnipilot.exe`. Dữ liệu (model, kịch bản, l
 Công cụ cho dev:
 
 ```bash
+# Đọc bước rồi tìm trên một ảnh chụp có sẵn, có thể kèm vùng tìm (không bấm gì)
+omnipilot.exe --find man-hinh.png "tìm phó bản không có chữ \"Đã qua\"" 0.27,0.1,0.97,0.95
 # Xem AI hiểu từng bước thế nào (không bấm gì vào game)
 omnipilot.exe --analyse "bấm xuất chiến góc phải dưới" "đợi đánh xong"
 # Chạy thử bằng AI → xuất/nhập → chạy lại bản đã nhập không cần AI

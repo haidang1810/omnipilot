@@ -1,6 +1,7 @@
-//! Headless test mode: `omnipilot --cli <instance index> "<bước 1>" "<bước 2>" ...`.
-//! Analyses each step, does a trial run with the AI, exports/imports the scenario,
-//! then replays the imported copy without the AI.
+//! Developer commands (no window):
+//! - `--analyse "<bước>" ...`: how the AI reads each step; taps nothing.
+//! - `--find <ảnh.png> "<bước>" [x1,y1,x2,y2]`: reads the step and searches a saved screenshot.
+//! - `--cli <giả lập> "<bước 1>" ...`: trial run with the AI, export/import, replay without it.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::channel;
@@ -9,21 +10,98 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 
-use crate::ai::AiServer;
+use crate::ai::{AiServer, Query};
 use crate::device;
 use crate::executor::{self, Event};
 use crate::script::{self, Node, Scenario};
 
-/// `omnipilot --analyse "<bước 1>" ...`: shows how the AI reads each step, taps nothing.
+fn print_node(n: &Node) {
+    match &n.step {
+        Some(s) => println!(
+            "  \"{}\" -> {}\n      {}",
+            n.text,
+            s.describe(),
+            serde_json::to_string(s).unwrap_or_default()
+        ),
+        None => println!("  \"{}\" -> (chưa hiểu)", n.text),
+    }
+    if let Some(o) = &n.otherwise {
+        println!(
+            "      nếu không thấy thì: \"{}\" -> {}",
+            o.text,
+            o.step.as_ref().map(|s| s.describe()).unwrap_or_default()
+        );
+    }
+}
+
+fn compile_all(server: &AiServer, nodes: &mut [Node]) -> Result<()> {
+    let mut err = None;
+    script::for_each_leaf_mut(nodes, &mut |n| {
+        if n.step.is_none() && err.is_none() {
+            if let Err(e) = server.compile_node(n) {
+                err = Some(e);
+            }
+        }
+    });
+    err.map_or(Ok(()), Err)
+}
+
 pub fn analyse(texts: &[String]) -> Result<()> {
     let t = Instant::now();
     let server = AiServer::start()?;
     println!("AI bật sau {:.1}s", t.elapsed().as_secs_f32());
-    for text in texts {
-        let t = Instant::now();
-        match server.compile_step(text) {
-            Ok(s) => println!("  \"{text}\" -> {}  ({:.1}s)\n      {}", s.describe(), t.elapsed().as_secs_f32(), serde_json::to_string(&s)?),
-            Err(e) => println!("  \"{text}\" -> LỖI: {e:#}"),
+    let mut nodes: Vec<Node> = texts.iter().map(|t| Node::with_text(t)).collect();
+    let t = Instant::now();
+    compile_all(&server, &mut nodes)?;
+    println!(
+        "Đọc {} bước trong {:.1}s",
+        nodes.len(),
+        t.elapsed().as_secs_f32()
+    );
+    nodes.iter().for_each(print_node);
+    Ok(())
+}
+
+pub fn find(png_path: &str, text: &str, region: Option<&str>) -> Result<()> {
+    let png = std::fs::read(png_path).with_context(|| format!("không đọc được {png_path}"))?;
+    let img = image::load_from_memory(&png)?.to_rgba8();
+    let region = region.map(|r| {
+        let v: Vec<f32> = r.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        [v[0], v[1], v[2], v[3]]
+    });
+    let server = AiServer::start()?;
+    let mut node = Node::with_text(text);
+    server.compile_node(&mut node)?;
+    print_node(&node);
+    let step = node.step.as_ref().unwrap();
+    let (target, hint) = match step {
+        script::Step::Tap { target, hint, .. } | script::Step::TapAll { target, hint, .. } => {
+            (target.as_str(), hint.as_str())
+        }
+        script::Step::WaitUntil { target, .. } => (target.as_str(), ""),
+        _ => anyhow::bail!("bước này không phải tìm nút"),
+    };
+    let q = Query {
+        target,
+        hint,
+        exclude: step.exclude(),
+        region,
+    };
+    let t = Instant::now();
+    let found = server.locate(&png, &img, &q, &|s| println!("{s}"))?;
+    match found {
+        Some(r) => println!(
+            "=> BẤM tại {:?}  ({:.1}s)",
+            r.center(),
+            t.elapsed().as_secs_f32()
+        ),
+        None => {
+            let next = if node.otherwise.is_some() {
+                " -> làm bước \"nếu không thấy\""
+            } else {
+                ""
+            };
+            println!("=> KHÔNG THẤY{next}  ({:.1}s)", t.elapsed().as_secs_f32())
         }
     }
     Ok(())
@@ -31,7 +109,10 @@ pub fn analyse(texts: &[String]) -> Result<()> {
 
 pub fn run(index: u32, texts: &[String]) -> Result<()> {
     let ld = device::find_ldplayer().context("không tìm thấy LDPlayer")?;
-    let inst = device::list_instances(&ld)?.into_iter().find(|i| i.index == index).context("không có instance này")?;
+    let inst = device::list_instances(&ld)?
+        .into_iter()
+        .find(|i| i.index == index)
+        .context("không có instance này")?;
     let (tx, rx) = channel::<Event>();
     std::thread::spawn(move || {
         while let Ok(e) = rx.recv() {
@@ -43,29 +124,24 @@ pub fn run(index: u32, texts: &[String]) -> Result<()> {
 
     let mut sc = Scenario::new();
     sc.name = "cli-test".into();
-    sc.steps = texts.iter().map(|t| Node { text: t.clone(), step: None }).collect();
+    sc.steps = texts.iter().map(|t| Node::with_text(t)).collect();
 
     let t = Instant::now();
     let ai = Arc::new(Mutex::new(Some(AiServer::start()?)));
     println!("AI bật sau {:.1}s", t.elapsed().as_secs_f32());
-    {
-        let guard = ai.lock().unwrap();
-        let server = guard.as_ref().unwrap();
-        let mut err = None;
-        script::for_each_leaf_mut(&mut sc.steps, &mut |n| match server.compile_step(&n.text) {
-            Ok(s) => {
-                println!("  \"{}\" -> {}", n.text, s.describe());
-                n.step = Some(s);
-            }
-            Err(e) => err = Some(e),
-        });
-        if let Some(e) = err {
-            return Err(e);
-        }
-    }
+    compile_all(ai.lock().unwrap().as_ref().unwrap(), &mut sc.steps)?;
+    sc.steps.iter().for_each(print_node);
 
     let t = Instant::now();
-    let mut runner = executor::new_runner(&ld, inst.clone(), sc.dir(), ai.clone(), true, Arc::new(AtomicBool::new(false)), tx.clone());
+    let mut runner = executor::new_runner(
+        &ld,
+        inst.clone(),
+        sc.dir(),
+        ai.clone(),
+        true,
+        Arc::new(AtomicBool::new(false)),
+        tx.clone(),
+    );
     runner.ensure_device()?;
     let result = runner.run(&mut sc.steps);
     sc.screen_size = runner.screen_size;
@@ -84,17 +160,33 @@ pub fn run(index: u32, texts: &[String]) -> Result<()> {
     let file = std::env::temp_dir().join("omnipilot-cli-test.omnipilot");
     sc.export(&file)?;
     let mut imported = Scenario::import(&file)?;
-    println!("Xuất/nhập: file {} bytes, kích thước {:?}", std::fs::metadata(&file)?.len(), imported.screen_size);
+    println!(
+        "Xuất/nhập: file {} bytes, kích thước {:?}",
+        std::fs::metadata(&file)?.len(),
+        imported.screen_size
+    );
     sc.delete();
     std::fs::remove_file(&file).ok();
 
     let t = Instant::now();
     let empty = Arc::new(Mutex::new(None));
-    let mut runner = executor::new_runner(&ld, inst, imported.dir(), empty.clone(), false, Arc::new(AtomicBool::new(false)), tx);
+    let mut runner = executor::new_runner(
+        &ld,
+        inst,
+        imported.dir(),
+        empty.clone(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+        tx,
+    );
     let result = runner.run(&mut imported.steps);
     drop(runner);
     imported.delete();
     result?;
-    println!("Chạy bản đã nhập (không AI) xong sau {:.1}s, AI có bị bật: {}", t.elapsed().as_secs_f32(), empty.lock().unwrap().is_some());
+    println!(
+        "Chạy bản đã nhập (không AI) xong sau {:.1}s, AI có bị bật: {}",
+        t.elapsed().as_secs_f32(),
+        empty.lock().unwrap().is_some()
+    );
     Ok(())
 }

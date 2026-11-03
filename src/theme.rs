@@ -3,7 +3,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, Frame, Margin, RichText, Stroke, TextStyle, Ui, vec2};
+use eframe::egui::{
+    self, Color32, CornerRadius, FontFamily, FontId, Frame, Margin, RichText, Stroke, TextStyle,
+    Ui, vec2,
+};
 
 pub const BG: Color32 = Color32::from_rgb(0x0d, 0x10, 0x16);
 pub const PANEL: Color32 = Color32::from_rgb(0x12, 0x16, 0x1e);
@@ -42,7 +45,13 @@ pub fn apply(ctx: &egui::Context) {
     v.window_stroke = Stroke::new(1.0_f32, BORDER);
 
     let w = &mut v.widgets;
-    for wv in [&mut w.noninteractive, &mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
+    for wv in [
+        &mut w.noninteractive,
+        &mut w.inactive,
+        &mut w.hovered,
+        &mut w.active,
+        &mut w.open,
+    ] {
         wv.corner_radius = CornerRadius::same(8);
         wv.expansion = 0.0;
     }
@@ -85,12 +94,15 @@ pub fn apply(ctx: &egui::Context) {
 
 fn install_fonts(ctx: &egui::Context) {
     // egui's built-in font lacks many Vietnamese glyphs; use Segoe UI from Windows.
-    let fonts_dir = PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into())).join("Fonts");
+    let fonts_dir = PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into()))
+        .join("Fonts");
     let mut fonts = egui::FontDefinitions::default();
     let mut load = |name: &str, file: &str| -> bool {
         match std::fs::read(fonts_dir.join(file)) {
             Ok(bytes) => {
-                fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_owned(bytes)));
+                fonts
+                    .font_data
+                    .insert(name.into(), Arc::new(egui::FontData::from_owned(bytes)));
                 true
             }
             Err(_) => false,
@@ -100,10 +112,18 @@ fn install_fonts(ctx: &egui::Context) {
     let semibold = load("segoe-sb", "seguisb.ttf");
     let mono = load("consolas", "consola.ttf");
     if regular {
-        fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "segoe".into());
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, "segoe".into());
     }
     if mono {
-        fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "consolas".into());
+        fonts
+            .families
+            .entry(FontFamily::Monospace)
+            .or_default()
+            .insert(0, "consolas".into());
     }
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
     // Bold family: semibold first, then everything Proportional has (incl. icons).
@@ -121,7 +141,11 @@ pub fn card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> egui::InnerRespon
 }
 
 pub fn card_frame(border: Color32) -> Frame {
-    Frame::new().fill(CARD).stroke(Stroke::new(1.0_f32, border)).corner_radius(12).inner_margin(Margin::same(16))
+    Frame::new()
+        .fill(CARD)
+        .stroke(Stroke::new(1.0_f32, border))
+        .corner_radius(12)
+        .inner_margin(Margin::same(16))
 }
 
 pub fn title(text: impl Into<String>) -> RichText {
@@ -134,7 +158,10 @@ pub fn muted(text: impl Into<String>) -> RichText {
 
 /// Filled, coloured call-to-action button.
 pub fn button(text: impl Into<String>, fill: Color32) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text).family(bold()).color(Color32::WHITE)).fill(fill).stroke(Stroke::NONE).min_size(vec2(0.0, 34.0))
+    egui::Button::new(RichText::new(text).family(bold()).color(Color32::WHITE))
+        .fill(fill)
+        .stroke(Stroke::NONE)
+        .min_size(vec2(0.0, 34.0))
 }
 
 /// Small rounded label.
@@ -143,7 +170,9 @@ pub fn chip(ui: &mut Ui, text: impl Into<String>, color: Color32) {
         .fill(color.gamma_multiply(0.14))
         .corner_radius(20)
         .inner_margin(Margin::symmetric(9, 3))
-        .show(ui, |ui| ui.label(RichText::new(text).size(12.5).color(color)));
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).size(12.5).color(color))
+        });
 }
 
 pub fn status_dot(ui: &mut Ui, color: Color32) {

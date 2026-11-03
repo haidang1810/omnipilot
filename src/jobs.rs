@@ -106,7 +106,13 @@ fn bridge(tx: &Sender<JobMsg>) -> Sender<Event> {
     etx
 }
 
-fn worker(mut scenario: Scenario, ld_dir: PathBuf, instance: Instance, stop: Arc<AtomicBool>, tx: Sender<JobMsg>) {
+fn worker(
+    mut scenario: Scenario,
+    ld_dir: PathBuf,
+    instance: Instance,
+    stop: Arc<AtomicBool>,
+    tx: Sender<JobMsg>,
+) {
     let status = |s: String| {
         let _ = tx.send(JobMsg::Status(s));
     };
@@ -127,7 +133,15 @@ fn worker(mut scenario: Scenario, ld_dir: PathBuf, instance: Instance, stop: Arc
         // A fresh, empty AI slot per run: if the run needs the AI it starts it,
         // and it is killed (RAM freed) as soon as `runner` is dropped below.
         let ai = Arc::new(Mutex::new(None));
-        let mut runner = executor::new_runner(&ld_dir, instance.clone(), scenario.dir(), ai, false, stop.clone(), bridge(&tx));
+        let mut runner = executor::new_runner(
+            &ld_dir,
+            instance.clone(),
+            scenario.dir(),
+            ai,
+            false,
+            stop.clone(),
+            bridge(&tx),
+        );
         let mut steps = scenario.steps.clone();
         let result = runner.ensure_device().and_then(|_| runner.run(&mut steps));
         let changed = runner.changed;
@@ -191,8 +205,16 @@ fn until_next(times: &[String]) -> Option<TimeDelta> {
         .iter()
         .filter_map(|t| NaiveTime::parse_from_str(t, "%H:%M").ok())
         .filter_map(|t| {
-            let today = now.date_naive().and_time(t).and_local_timezone(Local).single()?;
-            let next = if today > now { today } else { today + TimeDelta::days(1) };
+            let today = now
+                .date_naive()
+                .and_time(t)
+                .and_local_timezone(Local)
+                .single()?;
+            let next = if today > now {
+                today
+            } else {
+                today + TimeDelta::days(1)
+            };
             Some(next - now)
         })
         .min()

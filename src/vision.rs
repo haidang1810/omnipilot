@@ -10,7 +10,12 @@ pub const MATCH_THRESHOLD: f32 = 0.88;
 
 fn half_gray(img: &RgbaImage) -> GrayImage {
     let g = imageops::grayscale(img);
-    imageops::resize(&g, (g.width() / SCALE).max(1), (g.height() / SCALE).max(1), FilterType::Triangle)
+    imageops::resize(
+        &g,
+        (g.width() / SCALE).max(1),
+        (g.height() / SCALE).max(1),
+        FilterType::Triangle,
+    )
 }
 
 /// Integral images of values and squared values, (w+1)*(h+1).
@@ -48,10 +53,19 @@ impl Integral {
 
 /// Finds `tpl` on `screen`. Searches around `near` (top-left, full-res pixels) first,
 /// then the whole screen. Returns the full-res top-left corner and the score.
-pub fn find(screen: &RgbaImage, tpl: &RgbaImage, near: Option<(u32, u32)>) -> Option<(u32, u32, f32)> {
+pub fn find(
+    screen: &RgbaImage,
+    tpl: &RgbaImage,
+    near: Option<(u32, u32)>,
+) -> Option<(u32, u32, f32)> {
     let s = half_gray(screen);
     let t = half_gray(tpl);
-    let (sw, sh, tw, th) = (s.width() as usize, s.height() as usize, t.width() as usize, t.height() as usize);
+    let (sw, sh, tw, th) = (
+        s.width() as usize,
+        s.height() as usize,
+        t.width() as usize,
+        t.height() as usize,
+    );
     if tw < 4 || th < 4 || tw > sw || th > sh {
         return None;
     }
@@ -102,7 +116,12 @@ pub fn find(screen: &RgbaImage, tpl: &RgbaImage, near: Option<(u32, u32)>) -> Op
     if let Some((nx, ny)) = near {
         let r = 60 / SCALE as usize;
         let (cx, cy) = ((nx / SCALE) as usize, (ny / SCALE) as usize);
-        let best = search(cx.saturating_sub(r).min(max_x), cy.saturating_sub(r).min(max_y), (cx + r).min(max_x), (cy + r).min(max_y));
+        let best = search(
+            cx.saturating_sub(r).min(max_x),
+            cy.saturating_sub(r).min(max_y),
+            (cx + r).min(max_x),
+            (cy + r).min(max_y),
+        );
         if best.2 >= MATCH_THRESHOLD {
             return Some((best.0 as u32 * SCALE, best.1 as u32 * SCALE, best.2));
         }
@@ -115,8 +134,14 @@ pub fn find(screen: &RgbaImage, tpl: &RgbaImage, near: Option<(u32, u32)>) -> Op
 /// Measured on a real game: animated main screen ≈ 0.01 of pixels change strongly,
 /// opening another screen ≈ 0.65.
 pub fn changed(a: &RgbaImage, b: &RgbaImage) -> bool {
-    let small = |img: &RgbaImage| imageops::resize(&imageops::grayscale(img), 64, 36, FilterType::Triangle);
+    let small =
+        |img: &RgbaImage| imageops::resize(&imageops::grayscale(img), 64, 36, FilterType::Triangle);
     let (a, b) = (small(a), small(b));
-    let strong = a.as_raw().iter().zip(b.as_raw()).filter(|(x, y)| x.abs_diff(**y) > 40).count();
+    let strong = a
+        .as_raw()
+        .iter()
+        .zip(b.as_raw())
+        .filter(|(x, y)| x.abs_diff(**y) > 40)
+        .count();
     strong as f32 / (64.0 * 36.0) > 0.05
 }
