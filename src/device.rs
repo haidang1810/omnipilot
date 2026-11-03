@@ -176,6 +176,43 @@ impl Device {
         Ok(())
     }
 
+    /// Installed apps that are not part of Android (the games).
+    pub fn packages(&self) -> Result<Vec<String>> {
+        let out = self.adb(&["shell", "pm", "list", "packages", "-3"])?;
+        let mut list: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("package:").map(str::to_string))
+            .collect();
+        list.sort();
+        Ok(list)
+    }
+
+    /// Package of the app currently on screen, e.g. "com.kaiqigu.cjyxyn.kvsdk.offline".
+    pub fn foreground_package(&self) -> Option<String> {
+        let out = self.adb(&["shell", "dumpsys", "window"]).ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        // mCurrentFocus=Window{f437815 u0 com.example.game/com.example.MainActivity}
+        let line = text.lines().find(|l| l.contains("mCurrentFocus=Window{"))?;
+        let token = line.split_whitespace().find(|t| t.contains('/'))?;
+        Some(token.split('/').next()?.to_string())
+    }
+
+    /// Opens a game by its launcher activity (`monkey` is missing on LDPlayer).
+    pub fn launch_app(&self, package: &str) -> Result<()> {
+        let out = self.adb(&["shell", "cmd", "package", "resolve-activity", "--brief", "-c", "android.intent.category.LAUNCHER", package])?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let Some(activity) = text.lines().map(str::trim).rev().find(|l| l.starts_with(package) && l.contains('/')) else {
+            bail!("không tìm thấy màn hình khởi động của {package} (game đã bị gỡ?)");
+        };
+        self.adb(&["shell", "am", "start", "-n", activity])?;
+        Ok(())
+    }
+
+    pub fn stop_app(&self, package: &str) -> Result<()> {
+        self.adb(&["shell", "am", "force-stop", package])?;
+        Ok(())
+    }
+
     pub fn swipe(&self, from: (u32, u32), to: (u32, u32), ms: u32) -> Result<()> {
         let args = [from.0, from.1, to.0, to.1, ms].map(|v| v.to_string());
         let mut full = vec!["shell", "input", "swipe"];

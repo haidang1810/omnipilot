@@ -123,12 +123,59 @@ pub fn run_saved(index: u32, dir: &str) -> Result<()> {
     });
     let ai = Arc::new(Mutex::new(None));
     let t = Instant::now();
+    let started = chrono::Local::now();
+    let inst_name = inst.name.clone();
     let mut runner = executor::new_runner(&ld, inst, dir.into(), ai.clone(), false, Arc::new(AtomicBool::new(false)), tx);
+    runner.popups = sc.popups.clone();
+    runner.popup_dir = dir.into();
     runner.ensure_device()?;
-    let result = runner.run(&mut sc.steps);
+    let mut result = runner.ensure_app(&sc.recovery, dir.as_ref()).and_then(|_| runner.run_all(&mut sc.steps));
+    if let Err(e) = &result {
+        let r = &sc.recovery;
+        if r.home.is_some() || !r.package.trim().is_empty() {
+            println!("Lỗi: {e:#} -> thử tự phục hồi");
+            match runner.recover(r, dir.as_ref()) {
+                Ok(ok) => println!("Phục hồi: {}", if ok { "được" } else { "không được" }),
+                Err(e2) => println!("Phục hồi lỗi: {e2:#}"),
+            }
+        }
+        result = Err(anyhow::anyhow!("{e:#}"));
+    }
+    let shot = runner.last_screen.clone();
     drop(runner);
+    // Same history as a scheduled run (only for scenarios in the app's folder).
+    if std::path::Path::new(dir).starts_with(crate::paths::scenarios_dir()) {
+        crate::jobs::record_history(&sc, &inst_name, started, &result, shot.as_ref());
+        println!("Lịch sử: {} lượt", sc.history().len());
+    }
     println!("Xong sau {:.1}s, AI có bị bật: {}", t.elapsed().as_secs_f32(), ai.lock().unwrap().is_some());
     result
+}
+
+/// `--job <giả lập> <thư mục kịch bản>`: runs a saved scenario exactly like the Start
+/// button (schedule, recovery and retries, history) and prints its status lines.
+pub fn job(index: u32, dir: &str) -> Result<()> {
+    let ld = device::find_ldplayer().context("không tìm thấy LDPlayer")?;
+    let inst = device::list_instances(&ld)?.into_iter().find(|i| i.index == index).context("không có instance này")?;
+    let json = std::fs::read_to_string(std::path::Path::new(dir).join("scenario.json"))?;
+    let sc: Scenario = serde_json::from_str(json.trim_start_matches('\u{feff}'))?;
+    let mut job = crate::jobs::start(sc, ld, inst);
+    let mut shown = 0;
+    while !job.is_finished() || shown < job.log.len() {
+        job.poll();
+        for line in &job.log[shown..] {
+            println!("{line}");
+        }
+        shown = job.log.len();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    // The worker's last status may arrive just after it finished.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    job.poll();
+    for line in &job.log[shown..] {
+        println!("{line}");
+    }
+    Ok(())
 }
 
 pub fn run(index: u32, texts: &[String]) -> Result<()> {
@@ -167,7 +214,7 @@ pub fn run(index: u32, texts: &[String]) -> Result<()> {
         tx.clone(),
     );
     runner.ensure_device()?;
-    let result = runner.run(&mut sc.steps);
+    let result = runner.run_all(&mut sc.steps);
     sc.screen_size = runner.screen_size;
     drop(runner);
     if let Err(e) = result {
@@ -203,7 +250,7 @@ pub fn run(index: u32, texts: &[String]) -> Result<()> {
         Arc::new(AtomicBool::new(false)),
         tx,
     );
-    let result = runner.run(&mut imported.steps);
+    let result = runner.run_all(&mut imported.steps);
     drop(runner);
     imported.delete();
     result?;

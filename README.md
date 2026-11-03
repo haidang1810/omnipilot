@@ -29,7 +29,13 @@ Không cần cắt ảnh nút, không cần ghi tọa độ. AI chạy ngay trê
    - **Xem AI hiểu thế nào** (tùy chọn): AI đọc từng bước, hiện cách hiểu bên dưới mỗi ô, chưa bấm gì vào game.
    - **Chạy thử**: AI chạy thật trên giả lập, bạn xem màn hình và nhật ký ngay trong app. Lần này chậm vì AI phải nhìn từng màn hình.
    - Chạy đúng → **Lưu kịch bản**. AI tắt, giải phóng RAM.
-3. Ở màn hình chính: chọn giả lập cho kịch bản, bấm **Chạy**.
+   - **Khối điều kiện**: *Nếu thấy ảnh … thì … không thì …*, *Nếu số trong vùng … thì …* (vd thể lực đọc từ "97/120" ra 97), vòng lặp có **Dừng sớm khi…**, bước **Dừng kịch bản**.
+   - **Kịch bản con**: gọi một kịch bản khác (vd "về màn hình chính") thay vì làm lại các bước.
+   - **Popup & tự phục hồi**:
+     - *Quy tắc popup*: "thấy ảnh này ở đâu thì bấm vào nó / bấm điểm / nhấn Back", kiểm tra trước mỗi bước.
+     - *Tự phục hồi khi lỗi*: chọn một chi tiết của màn hình gốc và game cần mở. Khi lỗi, app nhấn Back để về màn hình gốc, không được thì khởi động lại game, rồi chạy lại (tối đa N lần). Đầu mỗi lượt, game chưa mở thì app tự mở.
+3. Ở màn hình chính: chọn **một hoặc nhiều giả lập** cho kịch bản (mỗi giả lập một tài khoản, chạy cùng lúc), bấm **Chạy**. Nút **Dừng tất cả** ở trên cùng.
+4. Bấm vào một kịch bản để xem nhật ký và màn hình từng giả lập, hoặc tab **Lịch sử**: các lượt đã chạy, lỗi gì, ảnh màn hình lúc lỗi.
 
 ### Chia sẻ kịch bản
 
@@ -73,6 +79,8 @@ omnipilot.exe --analyse "bấm xuất chiến góc phải dưới" "đợi đán
 omnipilot.exe --cli <số thứ tự giả lập> "vô túi đồ" "thoát ra"
 # Chạy một kịch bản đã lưu (như khi chạy theo lịch)
 omnipilot.exe --run <số thứ tự giả lập> "%LOCALAPPDATA%\OmniPilot\scenarios\<id>"
+# Chạy y như nút Chạy (lịch, tự phục hồi, chạy lại, lịch sử) và in trạng thái
+omnipilot.exe --job <số thứ tự giả lập> "%LOCALAPPDATA%\OmniPilot\scenarios\<id>"
 # Mở thẳng màn hình tạo kịch bản với ví dụ mẫu
 omnipilot.exe --demo
 ```

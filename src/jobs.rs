@@ -12,7 +12,7 @@ use image::RgbaImage;
 
 use crate::device::Instance;
 use crate::executor::{self, Event, Stopped};
-use crate::script::{Scenario, Schedule};
+use crate::script::{HistoryEntry, Scenario, Schedule};
 
 pub enum JobMsg {
     Event(Event),
@@ -24,6 +24,7 @@ pub enum JobMsg {
 pub struct Job {
     pub scenario_id: String,
     pub instance_index: u32,
+    pub instance_name: String,
     pub stop: Arc<AtomicBool>,
     rx: Receiver<JobMsg>,
     handle: Option<JoinHandle<()>>,
@@ -76,11 +77,13 @@ pub fn start(scenario: Scenario, ld_dir: PathBuf, instance: Instance) -> Job {
     let (tx, rx) = channel();
     let id = scenario.id.clone();
     let idx = instance.index;
+    let name = instance.name.clone();
     let stop2 = stop.clone();
     let handle = std::thread::spawn(move || worker(scenario, ld_dir, instance, stop2, tx));
     Job {
         scenario_id: id,
         instance_index: idx,
+        instance_name: name,
         stop,
         rx,
         handle: Some(handle),
@@ -129,34 +132,64 @@ fn worker(
             }
         }
 
-        status("Đang chạy".into());
-        // A fresh, empty AI slot per run: if the run needs the AI it starts it,
-        // and it is killed (RAM freed) as soon as `runner` is dropped below.
-        let ai = Arc::new(Mutex::new(None));
-        let mut runner = executor::new_runner(
-            &ld_dir,
-            instance.clone(),
-            scenario.dir(),
-            ai,
-            false,
-            stop.clone(),
-            bridge(&tx),
-        );
-        let mut steps = scenario.steps.clone();
-        let result = runner.ensure_device().and_then(|_| runner.run(&mut steps));
-        let changed = runner.changed;
-        drop(runner);
-
-        if changed {
-            scenario.steps = steps;
-            if scenario.save().is_ok() {
-                let _ = tx.send(JobMsg::Updated(scenario.clone()));
+        // One scheduled run, retried after a successful recovery.
+        let mut attempt = 0;
+        let stopped = loop {
+            status(if attempt == 0 { "Đang chạy".into() } else { format!("Chạy lại sau khi phục hồi (lần {attempt})") });
+            // A fresh, empty AI slot per run: if the run needs the AI it starts it,
+            // and it is killed (RAM freed) when `runner` is dropped at the end of the round.
+            let ai = Arc::new(Mutex::new(None));
+            let dir = scenario.dir();
+            let mut runner = executor::new_runner(&ld_dir, instance.clone(), dir.clone(), ai, false, stop.clone(), bridge(&tx));
+            runner.popups = scenario.popups.clone();
+            runner.popup_dir = dir.clone();
+            let mut steps = scenario.steps.clone();
+            let started = Local::now();
+            let result = runner
+                .ensure_device()
+                .and_then(|_| runner.ensure_app(&scenario.recovery, &dir))
+                .and_then(|_| runner.run_all(&mut steps));
+            let was_stopped = matches!(&result, Err(e) if e.downcast_ref::<Stopped>().is_some());
+            if !was_stopped {
+                record_history(&scenario, &instance.name, started, &result, runner.last_screen.as_ref());
             }
-        }
-        match result {
-            Ok(()) => status(format!("Xong lượt lúc {}", Local::now().format("%H:%M:%S"))),
-            Err(e) if e.downcast_ref::<Stopped>().is_some() => break,
-            Err(e) => status(format!("Lỗi: {e:#}")),
+            if runner.changed {
+                scenario.steps = steps;
+                if scenario.save().is_ok() {
+                    let _ = tx.send(JobMsg::Updated(scenario.clone()));
+                }
+            }
+            match result {
+                Ok(()) => {
+                    status(format!("Xong lượt lúc {}", Local::now().format("%H:%M:%S")));
+                    break false;
+                }
+                Err(_) if was_stopped => break true,
+                Err(e) => {
+                    status(format!("Lỗi: {e:#}"));
+                    let r = &scenario.recovery;
+                    let can_recover = r.home.is_some() || !r.package.trim().is_empty();
+                    if !can_recover || attempt >= r.retries {
+                        break false;
+                    }
+                    status("Đang tự phục hồi".into());
+                    match runner.recover(r, &dir) {
+                        Ok(true) => attempt += 1,
+                        Ok(false) => {
+                            status("Không phục hồi được".into());
+                            break false;
+                        }
+                        Err(e) if e.downcast_ref::<Stopped>().is_some() => break true,
+                        Err(e) => {
+                            status(format!("Phục hồi lỗi: {e:#}"));
+                            break false;
+                        }
+                    }
+                }
+            }
+        };
+        if stopped {
+            break;
         }
 
         if scenario.schedule == Schedule::Once {
@@ -177,6 +210,31 @@ fn worker(
         }
     }
     status("Đã dừng".into());
+}
+
+/// Saves one run in the scenario's history, with the screen at the moment it failed.
+pub fn record_history(sc: &Scenario, instance: &str, started: chrono::DateTime<Local>, result: &anyhow::Result<()>, screen: Option<&RgbaImage>) {
+    let ended = Local::now();
+    let screenshot = match (result, screen) {
+        (Err(_), Some(img)) => {
+            let name = format!("fail_{}_{}.png", ended.format("%Y%m%d_%H%M%S"), uuid::Uuid::new_v4().simple().to_string().get(..6).unwrap_or(""));
+            let _ = std::fs::create_dir_all(sc.history_dir());
+            img.save(sc.history_dir().join(&name)).ok().map(|_| name)
+        }
+        _ => None,
+    };
+    let entry = HistoryEntry {
+        started: started.format("%d/%m %H:%M:%S").to_string(),
+        ended: ended.format("%H:%M:%S").to_string(),
+        instance: instance.to_string(),
+        ok: result.is_ok(),
+        message: match result {
+            Ok(()) => "Xong".into(),
+            Err(e) => format!("{e:#}"),
+        },
+        screenshot,
+    };
+    let _ = sc.add_history(entry);
 }
 
 /// Sleeps up to `d`; returns false if stopped meanwhile.

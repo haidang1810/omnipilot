@@ -275,6 +275,15 @@ impl AiServer {
         Ok(None)
     }
 
+    /// Reads whatever text/numbers are in a small image (e.g. a stamina bar).
+    pub fn read_text_plain(&self, img: &RgbaImage) -> Result<String> {
+        // Small crops are hard to read; enlarge them.
+        let scale = (600 / img.width().max(1)).clamp(1, 4);
+        let big = image::imageops::resize(img, img.width() * scale, img.height() * scale, image::imageops::FilterType::Triangle);
+        let prompt = "Đọc toàn bộ chữ và số trong ảnh này. Chỉ trả về chữ đọc được.";
+        self.chat(json!([{"role": "user", "content": [Self::image_part(&encode_png(&big)?), {"type": "text", "text": prompt}]}]), 60, false)
+    }
+
     /// Reads the text on and just above an element (labels/tags often sit on top of it).
     fn read_text(&self, img: &RgbaImage, rect: Rect) -> Result<String> {
         let x = rect.x.saturating_sub(rect.w / 6);

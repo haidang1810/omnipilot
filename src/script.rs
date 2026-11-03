@@ -81,6 +81,26 @@ pub enum Step {
         #[serde(default = "d_loop_max")]
         max: u32,
         steps: Vec<Node>,
+        /// Stop looping as soon as this holds (checked before every round).
+        #[serde(default)]
+        until: Option<Cond>,
+    },
+    /// "Nếu … thì … không thì …".
+    If {
+        cond: Cond,
+        #[serde(default)]
+        then_steps: Vec<Node>,
+        #[serde(default)]
+        else_steps: Vec<Node>,
+    },
+    /// End this run successfully (e.g. out of stamina).
+    StopRun,
+    /// Run another saved scenario's steps here ("kịch bản con").
+    Call {
+        scenario_id: String,
+        /// Name at the time it was chosen, for display.
+        #[serde(default)]
+        name: String,
     },
     // ---- Steps set up by hand on the screenshot (no AI). ----
     /// Tap a fixed point, as fractions of the screen size.
@@ -110,6 +130,80 @@ pub enum Step {
 
 fn d_swipe_ms() -> u32 {
     400
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Cmp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+}
+
+impl Cmp {
+    pub const ALL: [Cmp; 5] = [Cmp::Lt, Cmp::Le, Cmp::Gt, Cmp::Ge, Cmp::Eq];
+
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Cmp::Lt => "<",
+            Cmp::Le => "≤",
+            Cmp::Gt => ">",
+            Cmp::Ge => "≥",
+            Cmp::Eq => "=",
+        }
+    }
+
+    pub fn test(self, a: f64, b: f64) -> bool {
+        match self {
+            Cmp::Lt => a < b,
+            Cmp::Le => a <= b,
+            Cmp::Gt => a > b,
+            Cmp::Ge => a >= b,
+            Cmp::Eq => (a - b).abs() < 1e-9,
+        }
+    }
+}
+
+/// Something checked on the current screen.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Cond {
+    /// The saved picture is visible (anywhere, or inside `region` if set).
+    SeeImage {
+        rec: Rec,
+        #[serde(default)]
+        region: Option<[f32; 4]>,
+    },
+    /// The first number read inside `region` (fractions of the screen) compares to `value`.
+    /// "97/120" reads as 97.
+    Number { region: [f32; 4], op: Cmp, value: f64 },
+}
+
+impl Cond {
+    pub fn new_image() -> Self {
+        Cond::SeeImage { rec: Rec { template: String::new(), x: 0, y: 0 }, region: None }
+    }
+
+    pub fn new_number() -> Self {
+        Cond::Number { region: [0.0; 4], op: Cmp::Lt, value: 10.0 }
+    }
+
+    pub fn needs_pick(&self) -> bool {
+        match self {
+            Cond::SeeImage { rec, .. } => rec.template.is_empty(),
+            Cond::Number { region, .. } => region[2] <= region[0],
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            _ if self.needs_pick() => "(chưa chọn trên màn hình)".into(),
+            Cond::SeeImage { .. } => "thấy ảnh".into(),
+            Cond::Number { op, value, .. } => format!("số trong vùng {} {value}", op.symbol()),
+        }
+    }
 }
 
 /// One row of the scenario editor.
@@ -161,17 +255,16 @@ impl Node {
     }
 
     pub fn new_loop() -> Self {
-        Self {
-            step: Some(Step::Loop {
-                max: 50,
-                steps: vec![Node::new()],
-            }),
-            ..Self::new()
-        }
+        Self { step: Some(Step::Loop { max: 50, steps: vec![Node::new()], until: None }), ..Self::new() }
     }
 
-    pub fn is_loop(&self) -> bool {
-        matches!(self.step, Some(Step::Loop { .. }))
+    pub fn new_if(cond: Cond) -> Self {
+        Self { step: Some(Step::If { cond, then_steps: Vec::new(), else_steps: Vec::new() }), ..Self::new() }
+    }
+
+    /// Loops and ifs: rows that hold other rows.
+    pub fn is_block(&self) -> bool {
+        self.step.as_ref().is_some_and(Step::is_block)
     }
 }
 
@@ -217,7 +310,11 @@ impl Step {
             } => format!("Đợi đến khi thấy \"{target}\" (tối đa {timeout_sec}s)"),
             Step::Wait { seconds } => format!("Chờ {seconds} giây"),
             Step::Back => "Nhấn Back".to_string(),
-            Step::Loop { max, .. } => format!("Lặp tối đa {max} lần"),
+            Step::Loop { max, until: None, .. } => format!("Lặp tối đa {max} lần"),
+            Step::Loop { max, until: Some(c), .. } => format!("Lặp tối đa {max} lần, dừng khi {}", c.describe()),
+            Step::If { cond, .. } => format!("Nếu {}", cond.describe()),
+            Step::StopRun => "Dừng kịch bản (kết thúc lượt này)".into(),
+            Step::Call { name, .. } => format!("Chạy kịch bản con \"{name}\""),
             _ if self.needs_pick() => "Chưa chọn vị trí trên màn hình".to_string(),
             Step::TapPoint { x, y } => format!("Bấm điểm ({:.0}%, {:.0}%)", x * 100.0, y * 100.0),
             Step::TapImage { all: false, .. } => "Bấm vào nút giống ảnh".to_string(),
@@ -267,8 +364,34 @@ impl Step {
                 *rec = None
             }
             Step::Loop { steps, .. } => clear_rec(steps),
+            Step::If { then_steps, else_steps, .. } => {
+                clear_rec(then_steps);
+                clear_rec(else_steps);
+            }
             _ => {}
         }
+    }
+
+    /// Nested step lists (loop body, if/else branches), in path order.
+    pub fn children_mut(&mut self) -> Vec<&mut Vec<Node>> {
+        match self {
+            Step::Loop { steps, .. } => vec![steps],
+            Step::If { then_steps, else_steps, .. } => vec![then_steps, else_steps],
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn children(&self) -> Vec<&Vec<Node>> {
+        match self {
+            Step::Loop { steps, .. } => vec![steps],
+            Step::If { then_steps, else_steps, .. } => vec![then_steps, else_steps],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Loops and ifs: rows that hold other rows.
+    pub fn is_block(&self) -> bool {
+        matches!(self, Step::Loop { .. } | Step::If { .. })
     }
 }
 
@@ -288,11 +411,15 @@ pub fn clear_rec(nodes: &mut [Node]) {
     });
 }
 
-/// Calls `f` on every non-loop node (and then on its "nếu không thấy" node), depth first.
+/// Calls `f` on every non-block node (and then on its "nếu không thấy" node), depth first.
 pub fn for_each_leaf_mut(nodes: &mut [Node], f: &mut dyn FnMut(&mut Node)) {
     for n in nodes {
         match &mut n.step {
-            Some(Step::Loop { steps, .. }) => for_each_leaf_mut(steps, f),
+            Some(s) if s.is_block() => {
+                for list in s.children_mut() {
+                    for_each_leaf_mut(list, f);
+                }
+            }
             _ => {
                 f(n);
                 if let Some(o) = n.otherwise.as_deref_mut() {
@@ -424,22 +551,89 @@ pub fn dynamic_count(nodes: &[Node]) -> usize {
         .iter()
         .map(|n| match &n.step {
             Some(Step::Tap { dynamic: true, .. }) => 1,
-            Some(Step::Loop { steps, .. }) => dynamic_count(steps),
+            Some(s) if s.is_block() => s.children().into_iter().map(|c| dynamic_count(c)).sum(),
             _ => 0,
         })
         .sum()
 }
 
-/// Number of steps the user typed (loops not counted).
+/// Number of steps (loops and ifs count only what is inside them).
 pub fn leaf_count(nodes: &[Node]) -> usize {
     nodes
         .iter()
         .map(|n| match &n.step {
-            Some(Step::Loop { steps, .. }) => leaf_count(steps),
+            Some(s) if s.is_block() => s.children().into_iter().map(|c| leaf_count(c)).sum(),
             _ => 1,
         })
         .sum()
 }
+
+/// What to do when a popup rule's picture shows up.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PopupAction {
+    /// Tap the matched picture itself (e.g. an "X" or "Đóng" button).
+    TapImage,
+    /// Tap a fixed point (fractions of the screen).
+    TapPoint { x: f32, y: f32 },
+    /// Android Back.
+    Back,
+}
+
+/// "Thấy ảnh này ở đâu thì …" – checked before every step.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PopupRule {
+    pub rec: Rec,
+    pub action: PopupAction,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// How to get back on track when a run fails.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Recovery {
+    /// Picture of the screen every run starts from (e.g. the game's main screen).
+    #[serde(default)]
+    pub home: Option<Rec>,
+    /// Android package of the game, to reopen it when it crashed or was closed.
+    #[serde(default)]
+    pub package: String,
+    /// How many times to press "back"/close before reopening the game.
+    #[serde(default = "d_max_back")]
+    pub max_back: u32,
+    /// Runs retried after a successful recovery.
+    #[serde(default = "d_retries")]
+    pub retries: u32,
+}
+
+fn d_max_back() -> u32 {
+    8
+}
+fn d_retries() -> u32 {
+    2
+}
+
+impl Default for Recovery {
+    fn default() -> Self {
+        Self { home: None, package: String::new(), max_back: d_max_back(), retries: d_retries() }
+    }
+}
+
+/// One run, for the history list.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct HistoryEntry {
+    pub started: String,
+    pub ended: String,
+    pub instance: String,
+    pub ok: bool,
+    pub message: String,
+    /// Screenshot saved when the run failed (file in the history folder).
+    #[serde(default)]
+    pub screenshot: Option<String>,
+}
+
+const HISTORY_KEEP: usize = 100;
+const HISTORY_SHOTS_KEEP: usize = 30;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -467,7 +661,16 @@ impl Schedule {
 pub struct Scenario {
     pub id: String,
     pub name: String,
+    /// Emulator used by older versions (one per scenario); see `instances`.
+    #[serde(default)]
     pub instance_index: u32,
+    /// Emulators this scenario runs on, all at the same time.
+    #[serde(default)]
+    pub instances: Vec<u32>,
+    #[serde(default)]
+    pub popups: Vec<PopupRule>,
+    #[serde(default)]
+    pub recovery: Recovery,
     pub schedule: Schedule,
     pub steps: Vec<Node>,
     /// True once a trial run was confirmed by the user.
@@ -483,6 +686,9 @@ impl Scenario {
             id: uuid::Uuid::new_v4().simple().to_string(),
             name: String::new(),
             instance_index: 0,
+            instances: Vec::new(),
+            popups: Vec::new(),
+            recovery: Recovery::default(),
             schedule: Schedule::Repeat { pause_minutes: 0 },
             steps: vec![Node::new()],
             recorded: false,
@@ -492,6 +698,51 @@ impl Scenario {
 
     pub fn dir(&self) -> PathBuf {
         paths::scenarios_dir().join(&self.id)
+    }
+
+    /// Every picture file the scenario uses (steps, popup rules, recovery).
+    pub fn templates(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        collect_templates(&self.steps, &mut names);
+        names.extend(self.popups.iter().map(|p| p.rec.template.clone()));
+        names.extend(self.recovery.home.iter().map(|r| r.template.clone()));
+        names.retain(|n| !n.is_empty());
+        names
+    }
+
+    /// The emulators to run on (older files only have `instance_index`).
+    pub fn targets(&self) -> Vec<u32> {
+        if self.instances.is_empty() { vec![self.instance_index] } else { self.instances.clone() }
+    }
+
+    pub fn history_dir(&self) -> PathBuf {
+        self.dir().join("history")
+    }
+
+    /// Adds a run to the history (newest last), keeping the last 100 runs and 30 screenshots.
+    pub fn add_history(&self, entry: HistoryEntry) -> Result<()> {
+        let dir = self.history_dir();
+        fs::create_dir_all(&dir)?;
+        let mut list = self.history();
+        list.push(entry);
+        let drop = list.len().saturating_sub(HISTORY_KEEP);
+        list.drain(..drop);
+        // Old failure screenshots go first.
+        let shots: Vec<usize> = list.iter().enumerate().filter(|(_, e)| e.screenshot.is_some()).map(|(i, _)| i).collect();
+        for &i in shots.iter().take(shots.len().saturating_sub(HISTORY_SHOTS_KEEP)) {
+            if let Some(f) = list[i].screenshot.take() {
+                let _ = fs::remove_file(dir.join(f));
+            }
+        }
+        fs::write(dir.join("history.json"), serde_json::to_string_pretty(&list)?)?;
+        Ok(())
+    }
+
+    pub fn history(&self) -> Vec<HistoryEntry> {
+        fs::read_to_string(self.history_dir().join("history.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
     }
 
     pub fn save(&self) -> Result<()> {
@@ -513,9 +764,7 @@ impl Scenario {
         let opts = zip::write::SimpleFileOptions::default();
         zip.start_file("scenario.json", opts)?;
         zip.write_all(serde_json::to_string_pretty(self)?.as_bytes())?;
-        let mut names = Vec::new();
-        collect_templates(&self.steps, &mut names);
-        for name in names {
+        for name in self.templates() {
             if let Ok(bytes) = fs::read(self.dir().join(&name)) {
                 zip.start_file(name, opts)?;
                 zip.write_all(&bytes)?;
@@ -538,8 +787,7 @@ impl Scenario {
             serde_json::from_str(strip_bom(&json)).context("scenario.json không hợp lệ")?;
         sc.id = uuid::Uuid::new_v4().simple().to_string();
 
-        let mut names = Vec::new();
-        collect_templates(&sc.steps, &mut names);
+        let names = sc.templates();
         if names.iter().any(|n| !is_template_name(n)) {
             bail!("file kịch bản chứa tên ảnh không hợp lệ");
         }
@@ -582,7 +830,19 @@ fn collect_templates(nodes: &[Node], out: &mut Vec<String>) {
                 | Step::TapAll { rec: Some(r), .. }
                 | Step::WaitUntil { rec: Some(r), .. },
             ) => out.push(r.template.clone()),
-            Some(Step::Loop { steps, .. }) => collect_templates(steps, out),
+            Some(s) if s.is_block() => {
+                let cond = match s {
+                    Step::If { cond, .. } => Some(cond),
+                    Step::Loop { until, .. } => until.as_ref(),
+                    _ => None,
+                };
+                if let Some(Cond::SeeImage { rec, .. }) = cond {
+                    out.push(rec.template.clone());
+                }
+                for list in s.children() {
+                    collect_templates(list, out);
+                }
+            }
             Some(s) => {
                 if let Some(r) = s.image() {
                     out.push(r.template.clone());

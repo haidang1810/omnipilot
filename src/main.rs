@@ -28,6 +28,13 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
+    if args.len() == 4 && args[1] == "--job" {
+        if let Err(e) = cli::job(args[2].parse().unwrap_or(0), &args[3]) {
+            eprintln!("Lỗi: {e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if args.len() == 4 && args[1] == "--run" {
         if let Err(e) = cli::run_saved(args[2].parse().unwrap_or(0), &args[3]) {
             eprintln!("Lỗi: {e:#}");

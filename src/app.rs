@@ -13,7 +13,7 @@ use crate::ai::AiServer;
 use crate::device::{self, Instance};
 use crate::executor::{self, Event, SharedAi};
 use crate::jobs::{self, Job};
-use crate::script::{self, Node, Scenario, Schedule, Step};
+use crate::script::{self, Cond, Node, Scenario, Schedule, Step};
 use crate::theme::{self, ACCENT, BORDER, CARD_HI, GREEN, MUTED, PANEL, RED, TEXT, YELLOW};
 use crate::{paths, setup};
 
@@ -212,11 +212,27 @@ enum TaskMsg {
 /// The step (and which part of it) whose point / picture / area is being picked.
 #[derive(Clone, PartialEq, Debug)]
 struct PickTarget {
-    /// Indices through loops.
+    /// Step path (see `node_at`); unused for popup rules and the start screen.
     path: Vec<usize>,
-    /// The step's "nếu không thấy thì" action rather than the step itself.
-    otherwise: bool,
+    slot: Slot,
     kind: PickKind,
+}
+
+/// Which part of a step (or of the scenario) a pick is for.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Slot {
+    /// The step itself (its point / picture / swipe / search area).
+    Step,
+    /// The step's "nếu không thấy thì" action.
+    Otherwise,
+    /// The condition of an "if" block or a loop's "dừng khi".
+    Cond,
+    /// The picture of popup rule #i.
+    PopupImage(usize),
+    /// The point tapped by popup rule #i.
+    PopupPoint(usize),
+    /// The start screen used by recovery.
+    Home,
 }
 
 struct Task {
@@ -245,6 +261,9 @@ struct Editor {
     picking: Option<PickTarget>,
     /// A screenshot being taken (for picking).
     shot_rx: Option<Receiver<Result<RgbaImage, String>>>,
+    /// Games installed on the emulator (for "mở lại game").
+    packages: Vec<String>,
+    packages_rx: Option<Receiver<Result<Vec<String>, String>>>,
     thumbs: ThumbCache,
 }
 
@@ -271,6 +290,8 @@ impl Editor {
             error: None,
             picking: None,
             shot_rx: None,
+            packages: Vec::new(),
+            packages_rx: None,
             thumbs: ThumbCache::default(),
         }
     }
@@ -313,6 +334,7 @@ impl Editor {
         let (tx, rx) = channel();
         let stop = Arc::new(AtomicBool::new(false));
         let (ai, dir, stop2) = (self.ai.clone(), self.sc.dir(), stop.clone());
+        let popups = self.sc.popups.clone();
         let mut nodes = self.sc.steps.clone();
         std::thread::spawn(move || {
             let r = (|| -> anyhow::Result<(Vec<Node>, Option<[u32; 2]>)> {
@@ -330,9 +352,11 @@ impl Editor {
                         let _ = fwd.send(TaskMsg::Event(e));
                     }
                 });
-                let mut runner = executor::new_runner(&ld, inst, dir, ai, true, stop2, etx);
+                let mut runner = executor::new_runner(&ld, inst, dir.clone(), ai, true, stop2, etx);
+                runner.popups = popups;
+                runner.popup_dir = dir;
                 runner.ensure_device()?;
-                runner.run(&mut nodes)?;
+                runner.run_all(&mut nodes)?;
                 Ok((nodes, runner.screen_size))
             })();
             let _ = tx.send(TaskMsg::TrialDone(r.map_err(|e| format!("{e:#}"))));
@@ -351,6 +375,7 @@ impl Editor {
         let (tx, rx) = channel();
         let stop = Arc::new(AtomicBool::new(false));
         let (ai, dir, stop2) = (self.ai.clone(), self.sc.dir(), stop.clone());
+        let popups = self.sc.popups.clone();
         std::thread::spawn(move || {
             let r = (|| -> anyhow::Result<()> {
                 let log_tx = tx.clone();
@@ -366,9 +391,11 @@ impl Editor {
                         let _ = fwd.send(TaskMsg::Event(e));
                     }
                 });
-                let mut runner = executor::new_runner(&ld, inst, dir, ai, true, stop2, etx);
+                let mut runner = executor::new_runner(&ld, inst, dir.clone(), ai, true, stop2, etx);
+                runner.popups = popups;
+                runner.popup_dir = dir;
                 runner.ensure_device()?;
-                runner.run(&mut nodes)
+                runner.run_all(&mut nodes)
             })();
             let _ = tx.send(TaskMsg::StepDone(r.map_err(|e| format!("{e:#}"))));
         });
@@ -377,36 +404,73 @@ impl Editor {
 
     /// Applies a finished pick to its step. Button pictures are cut from the screenshot
     /// and saved in the scenario folder.
-    fn apply_pick(&mut self, target: &PickTarget, picked: Picked) -> Result<(), String> {
+    /// Cuts a part of the current screenshot and saves it in the scenario folder.
+    fn save_crop(&self, r: [f32; 4]) -> Result<script::Rec, String> {
+        let img = self.screen.img.as_ref().ok_or("Chưa có ảnh màn hình")?;
+        let (w, h) = (img.width() as f32, img.height() as f32);
+        let (x, y) = ((r[0] * w) as u32, (r[1] * h) as u32);
+        let (cw, ch) = ((((r[2] - r[0]) * w) as u32).max(8), (((r[3] - r[1]) * h) as u32).max(8));
+        let (cw, ch) = (cw.min(img.width() - x), ch.min(img.height() - y));
         let dir = self.sc.dir();
-        let screen = self.screen.img.clone();
-        let node = target_node(&mut self.sc.steps, target).ok_or("Bước này không còn nữa")?;
-        match (target.kind, picked) {
-            (PickKind::Region, Picked::Rect(r)) => node.region = Some(r),
-            (PickKind::Point, Picked::Point([x, y])) => node.step = Some(Step::TapPoint { x, y }),
-            (PickKind::Swipe, Picked::Line(from, to)) => {
-                let ms = match node.step {
-                    Some(Step::Swipe { ms, .. }) => ms,
-                    _ => 400,
-                };
-                node.step = Some(Step::Swipe { from, to, ms });
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let name = format!("tpl_{}.png", uuid::Uuid::new_v4().simple());
+        image::imageops::crop_imm(img, x, y, cw, ch).to_image().save(dir.join(&name)).map_err(|e| e.to_string())?;
+        Ok(script::Rec { template: name, x, y })
+    }
+
+    /// Applies a finished pick to what it was for.
+    fn apply_pick(&mut self, target: &PickTarget, picked: Picked) -> Result<(), String> {
+        let mismatch = || "Kiểu chọn không khớp".to_string();
+        match (target.slot, picked) {
+            (Slot::PopupImage(i), Picked::Rect(r)) => {
+                let rec = self.save_crop(r)?;
+                self.sc.popups.get_mut(i).ok_or("Quy tắc này không còn nữa")?.rec = rec;
             }
-            (PickKind::Image, Picked::Rect(r)) => {
-                let img = screen.ok_or("Chưa có ảnh màn hình")?;
-                let (w, h) = (img.width() as f32, img.height() as f32);
-                let (x, y) = ((r[0] * w) as u32, (r[1] * h) as u32);
-                let (cw, ch) = ((((r[2] - r[0]) * w) as u32).max(8), (((r[3] - r[1]) * h) as u32).max(8));
-                let (cw, ch) = (cw.min(img.width() - x), ch.min(img.height() - y));
-                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                let name = format!("tpl_{}.png", uuid::Uuid::new_v4().simple());
-                image::imageops::crop_imm(&img, x, y, cw, ch).to_image().save(dir.join(&name)).map_err(|e| e.to_string())?;
-                let rec = script::Rec { template: name, x, y };
-                match &mut node.step {
-                    Some(Step::TapImage { rec: old, .. } | Step::WaitImage { rec: old, .. }) => *old = rec,
-                    _ => node.step = Some(Step::TapImage { all: false, max: 30, rec }),
+            (Slot::PopupPoint(i), Picked::Point([x, y])) => {
+                self.sc.popups.get_mut(i).ok_or("Quy tắc này không còn nữa")?.action = script::PopupAction::TapPoint { x, y };
+            }
+            (Slot::Home, Picked::Rect(r)) => self.sc.recovery.home = Some(self.save_crop(r)?),
+            (Slot::Cond, picked) => {
+                let rec = match (&picked, target.kind) {
+                    (Picked::Rect(r), PickKind::Image) => Some(self.save_crop(*r)?),
+                    _ => None,
+                };
+                let node = node_at(&mut self.sc.steps, &target.path).ok_or("Bước này không còn nữa")?;
+                let cond = cond_mut(node).ok_or_else(mismatch)?;
+                match (cond, picked, target.kind) {
+                    (Cond::SeeImage { rec: old, .. }, _, PickKind::Image) => *old = rec.ok_or_else(mismatch)?,
+                    (Cond::SeeImage { region, .. }, Picked::Rect(r), PickKind::Region) => *region = Some(r),
+                    (Cond::Number { region, .. }, Picked::Rect(r), PickKind::Region) => *region = r,
+                    _ => return Err(mismatch()),
                 }
             }
-            _ => return Err("Kiểu chọn không khớp với bước".into()),
+            (Slot::Step | Slot::Otherwise, picked) => {
+                let rec = match (&picked, target.kind) {
+                    (Picked::Rect(r), PickKind::Image) => Some(self.save_crop(*r)?),
+                    _ => None,
+                };
+                let node = target_node(&mut self.sc.steps, target).ok_or("Bước này không còn nữa")?;
+                match (target.kind, picked) {
+                    (PickKind::Region, Picked::Rect(r)) => node.region = Some(r),
+                    (PickKind::Point, Picked::Point([x, y])) => node.step = Some(Step::TapPoint { x, y }),
+                    (PickKind::Swipe, Picked::Line(from, to)) => {
+                        let ms = match node.step {
+                            Some(Step::Swipe { ms, .. }) => ms,
+                            _ => 400,
+                        };
+                        node.step = Some(Step::Swipe { from, to, ms });
+                    }
+                    (PickKind::Image, _) => {
+                        let rec = rec.ok_or_else(mismatch)?;
+                        match &mut node.step {
+                            Some(Step::TapImage { rec: old, .. } | Step::WaitImage { rec: old, .. }) => *old = rec,
+                            _ => node.step = Some(Step::TapImage { all: false, max: 30, rec }),
+                        }
+                    }
+                    _ => return Err(mismatch()),
+                }
+            }
+            _ => return Err(mismatch()),
         }
         Ok(())
     }
@@ -426,7 +490,36 @@ impl Editor {
         self.shot_rx = Some(rx);
     }
 
+    /// Lists the games installed on the emulator, in the background.
+    fn load_packages(&mut self, ld: PathBuf, inst: Instance) {
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let dev = device::Device::new(&ld, &inst);
+            dev.connect();
+            let current = dev.foreground_package();
+            let r = dev.packages().map(|mut list| {
+                // The game on screen right now goes first: it is most likely the one.
+                if let Some(c) = current.filter(|c| list.contains(c)) {
+                    list.retain(|p| *p != c);
+                    list.insert(0, c);
+                }
+                list
+            });
+            let _ = tx.send(r.map_err(|e| format!("Không lấy được danh sách game: {e:#}")));
+        });
+        self.packages_rx = Some(rx);
+    }
+
     fn poll(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.packages_rx {
+            if let Ok(r) = rx.try_recv() {
+                match r {
+                    Ok(list) => self.packages = list,
+                    Err(e) => self.error = Some(e),
+                }
+                self.packages_rx = None;
+            }
+        }
         if let Some(rx) = &self.shot_rx {
             if let Ok(r) = rx.try_recv() {
                 match r {
@@ -554,6 +647,13 @@ enum Page {
     Main,
 }
 
+#[derive(Clone, PartialEq)]
+enum DetailTab {
+    /// Live log/screen of the job on this emulator (None = the first one).
+    Live(Option<u32>),
+    History,
+}
+
 pub struct App {
     page: Page,
     setup: setup::SharedProgress,
@@ -565,6 +665,11 @@ pub struct App {
     jobs: Vec<Job>,
     selected: Option<String>,
     job_screen: ScreenView,
+    /// Detail panel: an emulator's live run, or the history list.
+    detail_tab: DetailTab,
+    /// History loaded for the selected scenario (refreshed when a run ends).
+    history: Vec<script::HistoryEntry>,
+    history_for: Option<String>,
     editor: Option<Editor>,
     confirm_delete: Option<String>,
     message: Option<(String, Color32)>,
@@ -628,11 +733,22 @@ impl App {
             jobs: Vec::new(),
             selected: None,
             job_screen: ScreenView::default(),
+            detail_tab: DetailTab::Live(None),
+            history: Vec::new(),
+            history_for: None,
             editor: None,
             confirm_delete: None,
             message: None,
         };
         app.refresh_instances();
+        // `--select <id> [history]`: opens the detail panel of a scenario (for screenshots).
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(i) = args.iter().position(|a| a == "--select") {
+            app.selected = args.get(i + 1).cloned();
+            if args.get(i + 2).map(String::as_str) == Some("history") {
+                app.detail_tab = DetailTab::History;
+            }
+        }
         if std::env::args().any(|a| a == "--demo") {
             let mut ed = Editor::new(demo_scenario(&app.instances), true);
             // Show the search-area picker on the live screen.
@@ -641,7 +757,7 @@ impl App {
                 app.instances.iter().find(|i| i.running),
             ) {
                 ed.capture(ld.clone(), inst.clone());
-                ed.picking = Some(PickTarget { path: vec![1, 0], otherwise: false, kind: PickKind::Image });
+                ed.picking = Some(PickTarget { path: vec![1, 0, 0], slot: Slot::Step, kind: PickKind::Image });
             }
             app.editor = Some(ed);
         }
@@ -765,8 +881,16 @@ impl App {
                                 .or(self.instances.first())
                             {
                                 sc.instance_index = i.index;
+                                sc.instances = vec![i.index];
                             }
                             self.editor = Some(Editor::new(sc, true));
+                        }
+                        if self.jobs.iter().any(|j| !j.is_finished())
+                            && ui.add(theme::button(format!("{} Dừng tất cả", ic::STOP), RED)).clicked()
+                        {
+                            for j in &self.jobs {
+                                j.stop.store(true, Ordering::Relaxed);
+                            }
                         }
                         if ui
                             .button(format!("{} Nhập", ic::DOWNLOAD_SIMPLE))
@@ -878,12 +1002,9 @@ impl App {
                     .show(ui, |ui| {
                         let instances = &self.instances;
                         for sc in &mut self.scenarios {
-                            let job = self
-                                .jobs
-                                .iter()
-                                .find(|j| j.scenario_id == sc.id && !j.is_finished());
+                            let running: Vec<&Job> = self.jobs.iter().filter(|j| j.scenario_id == sc.id && !j.is_finished()).collect();
                             let selected = self.selected.as_deref() == Some(sc.id.as_str());
-                            scenario_card(ui, sc, job, instances, selected, &mut actions);
+                            scenario_card(ui, sc, &running, instances, selected, &mut actions);
                             ui.add_space(8.0);
                         }
                     });
@@ -918,31 +1039,35 @@ impl App {
                     self.warn("Chưa cấu hình LDPlayer");
                     return;
                 };
-                let Some(inst) = self
-                    .instances
-                    .iter()
-                    .find(|i| i.index == sc.instance_index)
-                    .cloned()
-                else {
-                    self.warn("Chọn giả lập cho kịch bản trước");
-                    return;
-                };
-                if self
-                    .jobs
-                    .iter()
-                    .any(|j| j.instance_index == inst.index && !j.is_finished())
-                {
-                    self.warn(format!("Giả lập \"{}\" đang chạy kịch bản khác", inst.name));
-                    return;
-                }
+                let mut notes = Vec::new();
                 if !sc.recorded {
-                    self.warn("Kịch bản chưa chạy thử nên lần chạy này sẽ dùng AI (chậm hơn).");
-                } else if let Some(w) = size_warning(&sc, &inst) {
-                    self.warn(w);
+                    notes.push("Kịch bản chưa chạy thử nên lần chạy này sẽ dùng AI (chậm hơn).".to_string());
                 }
+                let mut started = 0;
                 self.jobs.retain(|j| !j.is_finished());
-                self.jobs.push(jobs::start(sc, ld_dir, inst));
+                for index in sc.targets() {
+                    let Some(inst) = self.instances.iter().find(|i| i.index == index).cloned() else {
+                        notes.push(format!("Không còn giả lập #{index}."));
+                        continue;
+                    };
+                    if self.jobs.iter().any(|j| j.instance_index == inst.index) {
+                        notes.push(format!("\"{}\" đang chạy kịch bản khác, bỏ qua.", inst.name));
+                        continue;
+                    }
+                    if let Some(w) = size_warning(&sc, &inst) {
+                        notes.push(w);
+                    }
+                    self.jobs.push(jobs::start(sc.clone(), ld_dir.clone(), inst));
+                    started += 1;
+                }
+                if started == 0 {
+                    notes.push("Chưa chạy được trên giả lập nào. Chọn giả lập cho kịch bản trước.".into());
+                }
+                if !notes.is_empty() {
+                    self.warn(notes.join(" "));
+                }
                 self.selected = Some(id);
+                self.detail_tab = DetailTab::Live(None);
                 self.job_screen = ScreenView::default();
             }
             RowAction::Stop(id) => {
@@ -993,6 +1118,7 @@ impl App {
                     .or(self.instances.first())
                 {
                     sc.instance_index = i.index;
+                    sc.instances = vec![i.index];
                     let _ = sc.save();
                 }
                 match self
@@ -1058,24 +1184,89 @@ impl App {
         let Some(id) = self.selected.clone() else {
             return;
         };
-        let name = self
-            .scenarios
-            .iter()
-            .find(|s| s.id == id)
-            .map(|s| s.name.clone())
-            .unwrap_or_default();
+        let Some(sc) = self.scenarios.iter().find(|s| s.id == id).cloned() else {
+            return;
+        };
+        // Newest job per emulator for this scenario.
+        let mut tabs: Vec<(u32, String, bool)> = Vec::new();
+        for j in self.jobs.iter().rev().filter(|j| j.scenario_id == id) {
+            if !tabs.iter().any(|t| t.0 == j.instance_index) {
+                tabs.push((j.instance_index, j.instance_name.clone(), !j.is_finished()));
+            }
+        }
+        tabs.reverse();
+        if self.history_for.as_deref() != Some(id.as_str()) || ui.ctx().input(|i| i.time) % 5.0 < 0.3 {
+            self.history = sc.history();
+            self.history_for = Some(id.clone());
+        }
+
         ui.horizontal(|ui| {
-            ui.label(theme::title(format!("{} {name}", ic::TERMINAL_WINDOW)));
+            ui.label(theme::title(format!("{} {}", ic::TERMINAL_WINDOW, sc.name)));
+            ui.add_space(8.0);
+            for (index, name, running) in &tabs {
+                let selected = match self.detail_tab {
+                    DetailTab::Live(Some(i)) => i == *index,
+                    DetailTab::Live(None) => tabs.first().map(|t| t.0) == Some(*index),
+                    DetailTab::History => false,
+                };
+                let dot = if *running { "● " } else { "" };
+                if ui.selectable_label(selected, format!("{dot}{name}")).clicked() {
+                    self.detail_tab = DetailTab::Live(Some(*index));
+                    self.job_screen = ScreenView::default();
+                }
+            }
+            if ui.selectable_label(self.detail_tab == DetailTab::History, format!("{} Lịch sử ({})", ic::CLOCK_COUNTER_CLOCKWISE, self.history.len())).clicked() {
+                self.detail_tab = DetailTab::History;
+                self.job_screen = ScreenView::default();
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button(ic::X).on_hover_text("Đóng").clicked() {
                     self.selected = None;
                 }
             });
         });
-        let Some(job) = self.jobs.iter().rev().find(|j| j.scenario_id == id) else {
-            ui.label(theme::muted(
-                "Kịch bản này chưa chạy lần nào kể từ khi mở app. Bấm Chạy để bắt đầu.",
-            ));
+
+        if self.detail_tab == DetailTab::History {
+            let mut show: Option<PathBuf> = None;
+            ui.columns(2, |cols| {
+                egui::ScrollArea::vertical().id_salt("history").auto_shrink([false, false]).max_height(280.0).show(&mut cols[0], |ui| {
+                    if self.history.is_empty() {
+                        ui.label(theme::muted("Chưa có lượt chạy nào."));
+                    }
+                    for e in self.history.iter().rev() {
+                        let (icon, color) = if e.ok { (ic::CHECK_CIRCLE, GREEN) } else { (ic::X_CIRCLE, RED) };
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(icon).color(color));
+                            ui.label(RichText::new(format!("{} → {}", e.started, e.ended)).monospace().size(12.5));
+                            ui.label(theme::muted(&e.instance));
+                            if let Some(file) = &e.screenshot {
+                                if ui.small_button(format!("{} Ảnh lúc lỗi", ic::IMAGE)).clicked() {
+                                    show = Some(sc.history_dir().join(file));
+                                }
+                            }
+                        });
+                        if !e.ok {
+                            ui.add(egui::Label::new(RichText::new(&e.message).size(12.5).color(RED)).wrap());
+                        }
+                        ui.add_space(2.0);
+                    }
+                });
+                self.job_screen.ui(&mut cols[1], None, None);
+            });
+            if let Some(path) = show {
+                if let Ok(img) = image::open(&path) {
+                    self.job_screen.set(ctx, &img.to_rgba8(), None);
+                }
+            }
+            return;
+        }
+
+        let wanted = match self.detail_tab {
+            DetailTab::Live(Some(i)) => Some(i),
+            _ => tabs.first().map(|t| t.0),
+        };
+        let Some(job) = self.jobs.iter().rev().find(|j| j.scenario_id == id && Some(j.instance_index) == wanted) else {
+            ui.label(theme::muted("Kịch bản này chưa chạy lần nào kể từ khi mở app. Bấm Chạy để bắt đầu, hoặc xem tab Lịch sử."));
             return;
         };
         if job.screen_gen != self.job_screen.shown_gen {
@@ -1095,6 +1286,8 @@ impl App {
         let mut close: Option<bool> = None; // Some(saved)
         let instances = self.instances.clone();
         let ld_dir = self.settings.ld_dir.clone();
+        let editing = self.editor.as_ref().map(|e| e.sc.id.clone()).unwrap_or_default();
+        let others: Vec<(String, String)> = self.scenarios.iter().filter(|s| s.id != editing).map(|s| (s.id.clone(), s.name.clone())).collect();
         let ed = self.editor.as_mut().unwrap();
         ed.poll(ctx);
         let busy = ed.task.is_some();
@@ -1147,7 +1340,7 @@ impl App {
                             .sc
                             .steps
                             .iter()
-                            .any(|n| n.is_loop() || !n.text.trim().is_empty());
+                            .any(|n| n.is_block() || n.manual || !n.text.trim().is_empty());
                     if let Some(t) = &ed.task {
                         if ui
                             .add(theme::button(format!("{} Dừng", ic::STOP), RED))
@@ -1221,11 +1414,11 @@ impl App {
                             ui.add(egui::TextEdit::singleline(&mut ed.sc.name).hint_text("vd: Đánh map cốt truyện").margin(theme::INPUT_MARGIN).desired_width(f32::INFINITY));
                             ui.add_space(4.0);
                             ui.label(theme::muted("Giả lập"));
-                            let text = instances.iter().find(|i| i.index == ed.sc.instance_index).map(|i| i.name.clone()).unwrap_or("(chọn giả lập)".into());
-                            egui::ComboBox::from_id_salt("ed_inst").selected_text(format!("{}  {text}", ic::DEVICE_MOBILE)).width(280.0).show_ui(ui, |ui| {
-                                for inst in &instances {
-                                    let label = format!("{}{}", inst.name, if inst.running { "  ● đang mở" } else { "" });
-                                    ui.selectable_value(&mut ed.sc.instance_index, inst.index, label);
+                            ui.horizontal_wrapped(|ui| {
+                                targets_menu(ui, "ed_targets", &mut ed.sc, &instances);
+                                if ed.sc.targets().len() > 1 {
+                                    let first = instances.iter().find(|i| i.index == ed.sc.instance_index).map(|i| i.name.clone()).unwrap_or_default();
+                                    ui.label(theme::muted(format!("Chụp màn hình và chạy thử dùng \"{first}\"")));
                                 }
                             });
                             ui.add_space(4.0);
@@ -1239,23 +1432,19 @@ impl App {
                             ui.label(theme::muted("Mỗi ô là một bước, viết như nói chuyện. vd: \"bấm xuất chiến góc phải dưới\", \"chọn ải mới nhất\", \"đợi đánh xong\", \"chờ 3 giây\"."));
                             ui.add_space(6.0);
                             let dir = ed.sc.dir();
-                            let mut st = StepsUi { counter: 0, changed: false, picking: ed.picking.as_ref(), pick_request: None, test_request: None, thumbs: &mut ed.thumbs, dir };
+                            let mut st = StepsUi { counter: 0, changed: false, picking: ed.picking.as_ref(), pick_request: None, test_request: None, thumbs: &mut ed.thumbs, dir, others: &others };
                             nodes_ui(ui, &mut ed.sc.steps, &mut Vec::new(), &mut st);
-                            let (mut changed, mut pick_request, test_request) = (st.changed, st.pick_request, st.test_request);
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
-                                if let Some((new, kind)) = add_step_menu(ui, format!("{} Thêm bước", ic::PLUS)) {
-                                    ed.sc.steps.push(new);
-                                    if let Some(kind) = kind {
-                                        pick_request = Some(PickTarget { path: vec![ed.sc.steps.len() - 1], otherwise: false, kind });
-                                    }
-                                    changed = true;
+                                if let Some(new) = add_step_menu(ui, format!("{} Thêm bước", ic::PLUS)) {
+                                    push_new(&mut ed.sc.steps, new, &[], &mut st);
                                 }
                                 if ui.button(format!("{} Thêm vòng lặp", ic::REPEAT)).on_hover_text("Lặp lại một nhóm bước, vd: đánh hết các map").clicked() {
                                     ed.sc.steps.push(Node::new_loop());
-                                    changed = true;
+                                    st.changed = true;
                                 }
                             });
+                            let (changed, pick_request, test_request) = (st.changed, st.pick_request, st.test_request);
                             if changed {
                                 ed.trial = None;
                             }
@@ -1281,6 +1470,16 @@ impl App {
                                 ui.label(RichText::new(format!("{} {n} bước có mục tiêu thay đổi mỗi lần (vd \"ải mới nhất\") nên lần chạy nào AI cũng bật lên cho các bước này.", ic::LIGHTNING)).color(YELLOW).size(13.0));
                             }
                         });
+                        ui.add_space(12.0);
+                        let pick = safety_card(ui, ed, &instances, &ld_dir);
+                        if let Some(t) = pick {
+                            ed.picking = if ed.picking.as_ref() == Some(&t) { None } else { Some(t) };
+                            if ed.picking.is_some() && ed.screen.tex.is_none() {
+                                if let (Some(ld), Some(inst)) = (&ld_dir, instances.iter().find(|i| i.index == ed.sc.instance_index)) {
+                                    ed.capture(ld.clone(), inst.clone());
+                                }
+                            }
+                        }
                     });
 
                     if let Some(e) = &ed.error {
@@ -1400,6 +1599,137 @@ impl App {
     }
 }
 
+/// "Popup & tự phục hồi": rules checked before every step, and how to recover from errors.
+/// Returns a pick request (popup picture/point, start screen).
+fn safety_card(ui: &mut egui::Ui, ed: &mut Editor, instances: &[Instance], ld_dir: &Option<PathBuf>) -> Option<PickTarget> {
+    let mut pick = None;
+    let dir = ed.sc.dir();
+    let picking = ed.picking.clone();
+    let is_picking = |slot: Slot| picking.as_ref().is_some_and(|p| p.slot == slot);
+    let request = |slot: Slot, kind: PickKind| Some(PickTarget { path: Vec::new(), slot, kind });
+    let mut changed = false;
+    let mut load_games: Option<Instance> = None;
+    theme::card(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(theme::title(format!("{} Popup & tự phục hồi", ic::SHIELD_CHECK)));
+        ui.label(theme::muted("Giúp kịch bản chạy lâu không kẹt: tự đóng popup bất ngờ, và tự quay về màn hình gốc hoặc mở lại game khi lỗi."));
+        ui.add_space(6.0);
+
+        ui.label(RichText::new("Popup: thấy ảnh này ở đâu thì…").family(theme::bold()));
+        let mut remove = None;
+        for (i, rule) in ed.sc.popups.iter_mut().enumerate() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(format!("{}.", i + 1)).color(MUTED));
+                if !rule.rec.template.is_empty() {
+                    if let Some(tex) = ed.thumbs.get(ui.ctx(), dir.join(&rule.rec.template)) {
+                        let [w, h] = tex.size().map(|v| v as f32);
+                        let scale = (34.0 / h).min(140.0 / w).min(1.5);
+                        ui.add(egui::Image::new((tex.id(), vec2(w * scale, h * scale))).corner_radius(4));
+                    }
+                }
+                if pick_button(ui, is_picking(Slot::PopupImage(i)), rule.rec.template.is_empty(), "ảnh popup") {
+                    pick = request(Slot::PopupImage(i), PickKind::Image);
+                }
+                ui.label(theme::muted("thì"));
+                let current = match rule.action {
+                    script::PopupAction::TapImage => "bấm vào chính ảnh đó",
+                    script::PopupAction::TapPoint { .. } => "bấm vào một điểm",
+                    script::PopupAction::Back => "nhấn Back",
+                };
+                egui::ComboBox::from_id_salt(("popup-action", i)).selected_text(current).width(170.0).show_ui(ui, |ui| {
+                    if ui.selectable_label(rule.action == script::PopupAction::TapImage, "bấm vào chính ảnh đó").clicked() {
+                        rule.action = script::PopupAction::TapImage;
+                        changed = true;
+                    }
+                    if ui.selectable_label(matches!(rule.action, script::PopupAction::TapPoint { .. }), "bấm vào một điểm").clicked() {
+                        pick = request(Slot::PopupPoint(i), PickKind::Point);
+                    }
+                    if ui.selectable_label(rule.action == script::PopupAction::Back, "nhấn Back").clicked() {
+                        rule.action = script::PopupAction::Back;
+                        changed = true;
+                    }
+                });
+                if let script::PopupAction::TapPoint { x, y } = rule.action {
+                    ui.label(theme::muted(format!("({:.0}%, {:.0}%)", x * 100.0, y * 100.0)));
+                }
+                ui.add(egui::TextEdit::singleline(&mut rule.note).hint_text("tên (vd bảng sự kiện)").desired_width(130.0));
+                if ui.small_button(ic::TRASH).on_hover_text("Xóa quy tắc").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            ed.sc.popups.remove(i);
+            changed = true;
+        }
+        if ui.button(format!("{} Thêm quy tắc popup", ic::PLUS)).on_hover_text("Khoanh nút đóng của popup (vd dấu X), app sẽ tự bấm mỗi khi nó hiện ra").clicked() {
+            ed.sc.popups.push(script::PopupRule { rec: empty_rec(), action: script::PopupAction::TapImage, note: String::new() });
+            pick = request(Slot::PopupImage(ed.sc.popups.len() - 1), PickKind::Image);
+            changed = true;
+        }
+
+        ui.add_space(10.0);
+        ui.label(RichText::new("Khi lỗi: tự phục hồi rồi chạy lại").family(theme::bold()));
+        let r = &mut ed.sc.recovery;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(theme::muted("Màn hình gốc"));
+            if let Some(home) = &r.home {
+                if let Some(tex) = ed.thumbs.get(ui.ctx(), dir.join(&home.template)) {
+                    let [w, h] = tex.size().map(|v| v as f32);
+                    let scale = (34.0 / h).min(140.0 / w).min(1.5);
+                    ui.add(egui::Image::new((tex.id(), vec2(w * scale, h * scale))).corner_radius(4));
+                }
+            }
+            if pick_button(ui, is_picking(Slot::Home), r.home.is_none(), "một phần của màn hình gốc") {
+                pick = request(Slot::Home, PickKind::Image);
+            }
+            if r.home.is_some() && ui.small_button(ic::X).clicked() {
+                r.home = None;
+                changed = true;
+            }
+        });
+        ui.label(RichText::new("Khoanh một chi tiết chỉ có ở màn hình bắt đầu kịch bản (vd nút \"Xuất chiến\" ở màn hình chính).").size(12.5).color(MUTED));
+        ui.horizontal_wrapped(|ui| {
+            ui.label(theme::muted("Game để mở lại"));
+            let shown = if r.package.is_empty() { "(chưa chọn)".to_string() } else { r.package.clone() };
+            egui::ComboBox::from_id_salt("recovery-package").selected_text(shown).width(260.0).show_ui(ui, |ui| {
+                if ui.selectable_label(r.package.is_empty(), "(không mở lại game)").clicked() {
+                    r.package.clear();
+                    changed = true;
+                }
+                for p in &ed.packages {
+                    if ui.selectable_label(r.package == *p, p).clicked() {
+                        r.package = p.clone();
+                        changed = true;
+                    }
+                }
+            });
+            let inst = instances.iter().find(|i| i.index == ed.sc.instance_index);
+            let can = ed.packages_rx.is_none() && ld_dir.is_some() && inst.is_some();
+            if ui.add_enabled(can, egui::Button::new(format!("{} Lấy danh sách game", ic::ARROWS_CLOCKWISE)).small()).on_hover_text("Mở game trên giả lập trước, game đó sẽ đứng đầu danh sách").clicked() {
+                load_games = inst.cloned();
+            }
+            if ed.packages_rx.is_some() {
+                ui.spinner();
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(theme::muted("Nhấn Back tối đa"));
+            changed |= ui.add(egui::DragValue::new(&mut r.max_back).range(0..=30)).changed();
+            ui.label(theme::muted("lần để về màn hình gốc, không được thì khởi động lại game; chạy lại tối đa"));
+            changed |= ui.add(egui::DragValue::new(&mut r.retries).range(0..=10)).changed();
+            ui.label(theme::muted("lần"));
+        });
+    });
+    if let (Some(inst), Some(ld)) = (load_games, ld_dir) {
+        ed.load_packages(ld.clone(), inst);
+    }
+    if changed {
+        ed.trial = None;
+    }
+    pick
+}
+
 /// `omnipilot --demo`: opens the editor with an example, to show what a scenario looks like.
 fn demo_scenario(instances: &[Instance]) -> Scenario {
     let mut sc = Scenario::new();
@@ -1417,6 +1747,8 @@ fn demo_scenario(instances: &[Instance]) -> Scenario {
         *steps = vec![challenge, node("đợi đánh xong"), Node::manual(Step::Wait { seconds: 2.0 })];
     }
     sc.steps = vec![Node::manual(Step::TapPoint { x: 0.42, y: 0.12 }), lp, node("thoát ra")];
+    sc.popups = vec![script::PopupRule { rec: empty_rec(), action: script::PopupAction::Back, note: "bảng sự kiện".into() }];
+    sc.recovery.package = "com.kaiqigu.cjyxyn.kvsdk.offline".into();
     sc
 }
 
@@ -1512,25 +1844,55 @@ struct StepsUi<'a> {
     thumbs: &'a mut ThumbCache,
     /// Scenario folder, where button pictures are stored.
     dir: PathBuf,
+    /// Other scenarios (id, name), for "Chạy kịch bản con".
+    others: &'a [(String, String)],
 }
 
-/// Finds a node by its path of indices through loops.
+impl StepsUi<'_> {
+    fn is_picking(&self, path: &[usize], slot: Slot, kind: PickKind) -> bool {
+        self.picking.is_some_and(|p| p.path == path && p.slot == slot && p.kind == kind)
+    }
+
+    fn request(&mut self, path: &[usize], slot: Slot, kind: PickKind) {
+        self.pick_request = Some(PickTarget { path: path.to_vec(), slot, kind });
+    }
+
+    /// Small picture of a saved button / screen part.
+    fn thumb(&mut self, ui: &mut egui::Ui, rec: &script::Rec) {
+        if let Some(tex) = self.thumbs.get(ui.ctx(), self.dir.join(&rec.template)) {
+            let [w, h] = tex.size().map(|v| v as f32);
+            let scale = (34.0 / h).min(160.0 / w).min(1.5);
+            ui.add(egui::Image::new((tex.id(), vec2(w * scale, h * scale))).corner_radius(4)).on_hover_text("Ảnh đã khoanh");
+        }
+    }
+}
+
+/// Finds a node by its path: an index in each list, and between nested lists the
+/// number of the child list (0 = loop body / "thì", 1 = "không thì").
 fn node_at<'a>(nodes: &'a mut [Node], path: &[usize]) -> Option<&'a mut Node> {
     let (first, rest) = path.split_first()?;
     let node = nodes.get_mut(*first)?;
     if rest.is_empty() {
         return Some(node);
     }
-    match &mut node.step {
-        Some(Step::Loop { steps, .. }) => node_at(steps, rest),
-        _ => None,
-    }
+    let (branch, rest) = rest.split_first()?;
+    let list = node.step.as_mut()?.children_mut().into_iter().nth(*branch)?;
+    node_at(list, rest)
 }
 
 /// The node a pick is for: the step itself or its "nếu không thấy thì" action.
 fn target_node<'a>(nodes: &'a mut [Node], t: &PickTarget) -> Option<&'a mut Node> {
     let node = node_at(nodes, &t.path)?;
-    if t.otherwise { node.otherwise.as_deref_mut() } else { Some(node) }
+    if t.slot == Slot::Otherwise { node.otherwise.as_deref_mut() } else { Some(node) }
+}
+
+/// The condition of an "if" block or a loop's "dừng khi".
+fn cond_mut(node: &mut Node) -> Option<&mut Cond> {
+    match node.step.as_mut()? {
+        Step::If { cond, .. } => Some(cond),
+        Step::Loop { until, .. } => until.as_mut(),
+        _ => None,
+    }
 }
 
 /// A growing, height-draggable text area for one step.
@@ -1571,44 +1933,68 @@ fn empty_rec() -> script::Rec {
     script::Rec { template: String::new(), x: 0, y: 0 }
 }
 
-/// The kinds of step the user can add, and what has to be picked on the screen for each.
-fn new_step_kinds() -> Vec<(String, &'static str, fn() -> (Node, Option<PickKind>))> {
+/// What has to be picked on the screen right after adding a step.
+type NewStep = (Node, Option<(Slot, PickKind)>);
+
+/// The kinds of step the user can add, in menu order (None = separator with a heading).
+fn new_step_kinds() -> Vec<Option<(String, &'static str, fn() -> NewStep)>> {
+    let image = Some((Slot::Step, PickKind::Image));
+    let _ = image;
     vec![
-        (format!("{} Viết bằng chữ (AI hiểu)", ic::PENCIL_SIMPLE), "Mô tả bước bằng tiếng Việt, AI tự tìm nút", || (Node::new(), None)),
-        (format!("{} Bấm vào nút (khoanh ảnh nút)", ic::IMAGE_SQUARE), "Khoanh quanh nút trên ảnh màn hình; mỗi lần chạy app tìm nút giống vậy rồi bấm", || {
-            (Node::manual(Step::TapImage { all: false, max: 30, rec: empty_rec() }), Some(PickKind::Image))
-        }),
-        (format!("{} Bấm hết các nút giống nhau", ic::COPY), "vd bấm hết các nút \"Nhận\" trên màn hình", || {
-            (Node::manual(Step::TapImage { all: true, max: 30, rec: empty_rec() }), Some(PickKind::Image))
-        }),
-        (format!("{} Bấm vào một điểm cố định", ic::HAND_TAP), "Bấm đúng một vị trí trên màn hình", || {
-            (Node::manual(Step::TapPoint { x: -1.0, y: -1.0 }), Some(PickKind::Point))
-        }),
-        (format!("{} Đợi đến khi thấy ảnh", ic::HOURGLASS), "Khoanh một phần màn hình; app đợi đến khi nó xuất hiện (vd chữ \"Chiến thắng\")", || {
-            (Node::manual(Step::WaitImage { timeout_sec: 300, rec: empty_rec() }), Some(PickKind::Image))
-        }),
-        (format!("{} Vuốt", ic::HAND_SWIPE_RIGHT), "Kéo từ điểm này đến điểm kia (vd cuộn danh sách)", || {
-            (Node::manual(Step::Swipe { from: [0.0, 0.0], to: [0.0, 0.0], ms: 400 }), Some(PickKind::Swipe))
-        }),
-        (format!("{} Chờ vài giây", ic::TIMER), "Nghỉ một lúc trước bước tiếp theo", || (Node::manual(Step::Wait { seconds: 2.0 }), None)),
-        (format!("{} Nhấn nút Back của Android", ic::ARROW_U_UP_LEFT), "Phím quay lại của điện thoại (một số game bỏ qua phím này)", || {
+        Some((format!("{} Viết bằng chữ (AI hiểu)", ic::PENCIL_SIMPLE), "Mô tả bước bằng tiếng Việt, AI tự tìm nút", || (Node::new(), None))),
+        None,
+        Some((format!("{} Bấm vào nút (khoanh ảnh nút)", ic::IMAGE_SQUARE), "Khoanh quanh nút trên ảnh màn hình; mỗi lần chạy app tìm nút giống vậy rồi bấm", || {
+            (Node::manual(Step::TapImage { all: false, max: 30, rec: empty_rec() }), Some((Slot::Step, PickKind::Image)))
+        })),
+        Some((format!("{} Bấm hết các nút giống nhau", ic::COPY), "vd bấm hết các nút \"Nhận\" trên màn hình", || {
+            (Node::manual(Step::TapImage { all: true, max: 30, rec: empty_rec() }), Some((Slot::Step, PickKind::Image)))
+        })),
+        Some((format!("{} Bấm vào một điểm cố định", ic::HAND_TAP), "Bấm đúng một vị trí trên màn hình", || {
+            (Node::manual(Step::TapPoint { x: -1.0, y: -1.0 }), Some((Slot::Step, PickKind::Point)))
+        })),
+        Some((format!("{} Đợi đến khi thấy ảnh", ic::HOURGLASS), "Khoanh một phần màn hình; app đợi đến khi nó xuất hiện (vd chữ \"Chiến thắng\")", || {
+            (Node::manual(Step::WaitImage { timeout_sec: 300, rec: empty_rec() }), Some((Slot::Step, PickKind::Image)))
+        })),
+        Some((format!("{} Vuốt", ic::HAND_SWIPE_RIGHT), "Kéo từ điểm này đến điểm kia (vd cuộn danh sách)", || {
+            (Node::manual(Step::Swipe { from: [0.0, 0.0], to: [0.0, 0.0], ms: 400 }), Some((Slot::Step, PickKind::Swipe)))
+        })),
+        Some((format!("{} Chờ vài giây", ic::TIMER), "Nghỉ một lúc trước bước tiếp theo", || (Node::manual(Step::Wait { seconds: 2.0 }), None))),
+        Some((format!("{} Nhấn nút Back của Android", ic::ARROW_U_UP_LEFT), "Phím quay lại của điện thoại (một số game bỏ qua phím này)", || {
             (Node::manual(Step::Back), None)
-        }),
+        })),
+        None,
+        Some((format!("{} Nếu thấy ảnh … thì … không thì …", ic::GIT_BRANCH), "Rẽ nhánh theo việc có thấy một hình trên màn hình hay không", || {
+            (Node::new_if(Cond::new_image()), Some((Slot::Cond, PickKind::Image)))
+        })),
+        Some((format!("{} Nếu số trong vùng … thì …", ic::HASH), "Đọc số trong một vùng (vd thể lực 97/120 đọc ra 97) rồi so sánh", || {
+            (Node::new_if(Cond::new_number()), Some((Slot::Cond, PickKind::Region)))
+        })),
+        Some((format!("{} Dừng kịch bản", ic::STOP_CIRCLE), "Kết thúc lượt chạy này (vd khi hết thể lực)", || (Node::manual(Step::StopRun), None))),
+        Some((format!("{} Chạy kịch bản con", ic::FLOW_ARROW), "Chạy các bước của một kịch bản khác ở đây (vd \"về màn hình chính\")", || {
+            (Node::manual(Step::Call { scenario_id: String::new(), name: String::new() }), None)
+        })),
     ]
 }
 
-/// "Thêm bước" menu. Returns the new node and what still has to be picked for it.
-fn add_step_menu(ui: &mut egui::Ui, label: String) -> Option<(Node, Option<PickKind>)> {
+/// "Thêm bước" menu.
+fn add_step_menu(ui: &mut egui::Ui, label: String) -> Option<NewStep> {
     let mut out = None;
+    let headings = ["Làm bằng tay trên màn hình (không cần AI)", "Điều kiện, kịch bản con"];
     ui.menu_button(label, |ui| {
-        for (i, (text, tip, make)) in new_step_kinds().into_iter().enumerate() {
-            if i == 1 {
-                ui.separator();
-                ui.label(RichText::new("Làm bằng tay trên màn hình (không cần AI)").size(12.5).color(MUTED));
-            }
-            if ui.button(text).on_hover_text(tip).clicked() {
-                out = Some(make());
-                ui.close();
+        let mut heading = 0;
+        for item in new_step_kinds() {
+            match item {
+                None => {
+                    ui.separator();
+                    ui.label(RichText::new(headings[heading.min(1)]).size(12.5).color(MUTED));
+                    heading += 1;
+                }
+                Some((text, tip, make)) => {
+                    if ui.button(text).on_hover_text(tip).clicked() {
+                        out = Some(make());
+                        ui.close();
+                    }
+                }
             }
         }
     });
@@ -1624,6 +2010,8 @@ fn step_icon(step: &Step) -> &'static str {
         Step::Swipe { .. } => ic::HAND_SWIPE_RIGHT,
         Step::Wait { .. } => ic::TIMER,
         Step::Back => ic::ARROW_U_UP_LEFT,
+        Step::StopRun => ic::STOP_CIRCLE,
+        Step::Call { .. } => ic::FLOW_ARROW,
         _ => ic::PENCIL_SIMPLE,
     }
 }
@@ -1637,32 +2025,80 @@ fn pick_kind_of(step: &Step) -> Option<PickKind> {
     }
 }
 
+fn pick_button(ui: &mut egui::Ui, picking: bool, unset: bool, what: &str) -> bool {
+    let label = match (picking, unset) {
+        (true, _) => "Đang chọn trên màn hình…".to_string(),
+        (false, true) => format!("Chọn {what}"),
+        (false, false) => format!("Chọn lại {what}"),
+    };
+    ui.add(egui::Button::new(RichText::new(format!("{} {label}", ic::CURSOR_CLICK)).size(13.0)).small().selected(picking)).clicked()
+}
+
+/// Editor for a condition ("thấy ảnh" / "số trong vùng …").
+fn cond_ui(ui: &mut egui::Ui, cond: &mut Cond, st: &mut StepsUi, path: &[usize]) {
+    ui.horizontal_wrapped(|ui| match cond {
+        Cond::SeeImage { rec, region } => {
+            ui.label(RichText::new("thấy ảnh").color(TEXT));
+            if !rec.template.is_empty() {
+                let rec = rec.clone();
+                st.thumb(ui, &rec);
+            }
+            let picking = st.is_picking(path, Slot::Cond, PickKind::Image);
+            if pick_button(ui, picking, rec.template.is_empty(), "ảnh") {
+                st.request(path, Slot::Cond, PickKind::Image);
+            }
+            let picking = st.is_picking(path, Slot::Cond, PickKind::Region);
+            let label = if region.is_some() { format!("{} Vùng tìm ✓", ic::SELECTION) } else { format!("{} Vùng tìm", ic::SELECTION) };
+            if ui.add(egui::Button::new(RichText::new(label).size(13.0)).small().selected(picking || region.is_some())).clicked() {
+                st.request(path, Slot::Cond, PickKind::Region);
+            }
+            if region.is_some() && ui.small_button(ic::X).on_hover_text("Bỏ vùng tìm").clicked() {
+                *region = None;
+                st.changed = true;
+            }
+        }
+        Cond::Number { region, op, value } => {
+            ui.label(RichText::new("số trong vùng").color(TEXT));
+            let unset = region[2] <= region[0];
+            let picking = st.is_picking(path, Slot::Cond, PickKind::Region);
+            if pick_button(ui, picking, unset, "vùng") {
+                st.request(path, Slot::Cond, PickKind::Region);
+            }
+            egui::ComboBox::from_id_salt(("cmp", path.to_vec())).selected_text(op.symbol()).width(46.0).show_ui(ui, |ui| {
+                for c in script::Cmp::ALL {
+                    if ui.selectable_value(op, c, c.symbol()).changed() {
+                        st.changed = true;
+                    }
+                }
+            });
+            if ui.add(egui::DragValue::new(value).speed(1.0)).changed() {
+                st.changed = true;
+            }
+        }
+    });
+}
+
 /// Description, button picture and settings of a hand-made step.
 fn manual_body(ui: &mut egui::Ui, node: &mut Node, st: &mut StepsUi, path: &[usize], otherwise: bool) {
+    let slot = if otherwise { Slot::Otherwise } else { Slot::Step };
     let Some(step) = node.step.as_mut() else { return };
     let unset = step.needs_pick();
     ui.horizontal_wrapped(|ui| {
         let color = if unset { YELLOW } else { TEXT };
-        ui.label(RichText::new(format!("{} {}", step_icon(step), step.describe())).color(color).family(theme::bold()).size(14.0));
+        let text = match &*step {
+            Step::Call { scenario_id, .. } if scenario_id.is_empty() => "Chọn kịch bản con".to_string(),
+            s => s.describe(),
+        };
+        ui.label(RichText::new(format!("{} {text}", step_icon(step))).color(color).family(theme::bold()).size(14.0));
         if let Some(rec) = step.image() {
-            if let Some(tex) = st.thumbs.get(ui.ctx(), st.dir.join(&rec.template)) {
-                let [w, h] = tex.size().map(|v| v as f32);
-                let scale = (34.0 / h).min(160.0 / w).min(1.5);
-                ui.add(egui::Image::new((tex.id(), vec2(w * scale, h * scale))).corner_radius(4))
-                    .on_hover_text("Ảnh nút đã khoanh");
-            }
+            let rec = rec.clone();
+            st.thumb(ui, &rec);
         }
     });
     ui.horizontal_wrapped(|ui| {
         if let Some(kind) = pick_kind_of(step) {
-            let picking_this = st.picking.is_some_and(|p| p.path == path && p.otherwise == otherwise && p.kind == kind);
-            let label = match (picking_this, unset) {
-                (true, _) => "Đang chọn trên màn hình…",
-                (false, true) => "Chọn trên màn hình",
-                (false, false) => "Chọn lại",
-            };
-            if ui.add(egui::Button::new(RichText::new(format!("{} {label}", ic::CURSOR_CLICK)).size(13.0)).small().selected(picking_this)).clicked() {
-                st.pick_request = Some(PickTarget { path: path.to_vec(), otherwise, kind });
+            if pick_button(ui, st.is_picking(path, slot, kind), unset, "trên màn hình") {
+                st.request(path, slot, kind);
             }
         }
         let muted = |t: &str| RichText::new(t).size(13.0).color(MUTED);
@@ -1691,6 +2127,23 @@ fn manual_body(ui: &mut egui::Ui, node: &mut Node, st: &mut StepsUi, path: &[usi
                 ui.label(muted("ms"));
                 c
             }
+            Step::Call { scenario_id, name } => {
+                let mut c = false;
+                let shown = if name.is_empty() { "(chọn kịch bản)".to_string() } else { name.clone() };
+                egui::ComboBox::from_id_salt(("call", path.to_vec(), otherwise)).selected_text(shown).width(240.0).show_ui(ui, |ui| {
+                    if st.others.is_empty() {
+                        ui.label(theme::muted("Chưa có kịch bản nào khác"));
+                    }
+                    for (id, n) in st.others {
+                        if ui.selectable_label(scenario_id == id, n).clicked() {
+                            *scenario_id = id.clone();
+                            *name = n.clone();
+                            c = true;
+                        }
+                    }
+                });
+                c
+            }
             _ => false,
         };
         st.changed |= changed;
@@ -1700,53 +2153,112 @@ fn manual_body(ui: &mut egui::Ui, node: &mut Node, st: &mut StepsUi, path: &[usi
     }
 }
 
-/// Editable list of steps; loops render as nested blocks.
+/// Adds a node to `list` and, if needed, asks to pick something for it right away.
+fn push_new(list: &mut Vec<Node>, (node, pick): NewStep, list_path: &[usize], st: &mut StepsUi) {
+    list.push(node);
+    if let Some((slot, kind)) = pick {
+        let mut p = list_path.to_vec();
+        p.push(list.len() - 1);
+        st.request(&p, slot, kind);
+    }
+    st.changed = true;
+}
+
+/// A loop / if block with its nested lists.
+fn block_ui(ui: &mut egui::Ui, node: &mut Node, path: &mut Vec<usize>, st: &mut StepsUi, row_buttons: &mut dyn FnMut(&mut egui::Ui)) {
+    let frame = egui::Frame::new().fill(CARD_HI).stroke(egui::Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.5))).corner_radius(10).inner_margin(Margin::same(12));
+    frame.show(ui, |ui| match node.step.as_mut() {
+        Some(Step::Loop { max, steps, until }) => {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{} Lặp lại tối đa", ic::REPEAT)).color(ACCENT).family(theme::bold()));
+                st.changed |= ui.add(egui::DragValue::new(max).range(1..=999)).changed();
+                ui.label(RichText::new("lần").color(ACCENT).family(theme::bold()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| row_buttons(ui));
+            });
+            ui.label(RichText::new("Tự dừng khi một bước bên trong không tìm thấy nút (vd hết map).").size(12.5).color(MUTED));
+            ui.horizontal_wrapped(|ui| {
+                match until {
+                    Some(c) => {
+                        ui.label(RichText::new(format!("{} Dừng sớm khi", ic::FLAG_CHECKERED)).color(ACCENT));
+                        cond_ui(ui, c, st, path);
+                        if ui.small_button(ic::X).on_hover_text("Bỏ điều kiện dừng").clicked() {
+                            *until = None;
+                            st.changed = true;
+                        }
+                    }
+                    None => {
+                        ui.menu_button(RichText::new(format!("{} Dừng sớm khi…", ic::FLAG_CHECKERED)).size(13.0), |ui| {
+                            if ui.button(format!("{} thấy một ảnh", ic::IMAGE_SQUARE)).clicked() {
+                                *until = Some(Cond::new_image());
+                                st.request(path, Slot::Cond, PickKind::Image);
+                                st.changed = true;
+                                ui.close();
+                            }
+                            if ui.button(format!("{} số trong vùng …", ic::HASH)).clicked() {
+                                *until = Some(Cond::new_number());
+                                st.request(path, Slot::Cond, PickKind::Region);
+                                st.changed = true;
+                                ui.close();
+                            }
+                        });
+                    }
+                }
+            });
+            ui.add_space(4.0);
+            path.push(0);
+            nodes_ui(ui, steps, path, st);
+            if let Some(new) = add_step_menu(ui, format!("{} Thêm bước vào vòng lặp", ic::PLUS)) {
+                let list_path = path.clone();
+                push_new(steps, new, &list_path, st);
+            }
+            path.pop();
+        }
+        Some(Step::If { cond, then_steps, else_steps }) => {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(format!("{} Nếu", ic::GIT_BRANCH)).color(ACCENT).family(theme::bold()));
+                cond_ui(ui, cond, st, path);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| row_buttons(ui));
+            });
+            for (branch, (title, list)) in [("thì", then_steps), ("không thì", else_steps)].into_iter().enumerate() {
+                ui.add_space(4.0);
+                ui.label(RichText::new(title).color(ACCENT).family(theme::bold()).size(13.5));
+                path.push(branch);
+                if list.is_empty() {
+                    ui.label(RichText::new("(không làm gì)").size(12.5).color(MUTED));
+                }
+                nodes_ui(ui, list, path, st);
+                if let Some(new) = add_step_menu(ui, format!("{} Thêm bước", ic::PLUS)) {
+                    let list_path = path.clone();
+                    push_new(list, new, &list_path, st);
+                }
+                path.pop();
+            }
+        }
+        _ => {}
+    });
+}
+
+/// Editable list of steps; loops and ifs render as nested blocks.
 fn nodes_ui(ui: &mut egui::Ui, nodes: &mut Vec<Node>, path: &mut Vec<usize>, st: &mut StepsUi) {
     let mut action = None;
     let len = nodes.len();
-    let in_loop = !path.is_empty();
+    let in_block = !path.is_empty();
     for (i, node) in nodes.iter_mut().enumerate() {
         path.push(i);
-        let row_buttons = |ui: &mut egui::Ui, action: &mut Option<NodeAction>| {
+        let mut row_buttons = |ui: &mut egui::Ui| {
             if ui.small_button(ic::TRASH).on_hover_text("Xóa").clicked() {
-                *action = Some(NodeAction::Remove(i));
+                action = Some(NodeAction::Remove(i));
             }
             if ui.add_enabled(i + 1 < len, egui::Button::new(ic::ARROW_DOWN).small()).on_hover_text("Chuyển xuống").clicked() {
-                *action = Some(NodeAction::Down(i));
+                action = Some(NodeAction::Down(i));
             }
             if ui.add_enabled(i > 0, egui::Button::new(ic::ARROW_UP).small()).on_hover_text("Chuyển lên").clicked() {
-                *action = Some(NodeAction::Up(i));
+                action = Some(NodeAction::Up(i));
             }
         };
 
-        if let Some(Step::Loop { max, steps }) = &mut node.step {
-            egui::Frame::new()
-                .fill(CARD_HI)
-                .stroke(egui::Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.5)))
-                .corner_radius(10)
-                .inner_margin(Margin::same(12))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("{} Lặp lại tối đa", ic::REPEAT)).color(ACCENT).family(theme::bold()));
-                        if ui.add(egui::DragValue::new(max).range(1..=999)).changed() {
-                            st.changed = true;
-                        }
-                        ui.label(RichText::new("lần").color(ACCENT).family(theme::bold()));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| row_buttons(ui, &mut action));
-                    });
-                    ui.label(RichText::new("Tự dừng khi một bước bên trong không tìm thấy nút (vd hết map).").size(12.5).color(MUTED));
-                    ui.add_space(4.0);
-                    nodes_ui(ui, steps, path, st);
-                    if let Some((new, kind)) = add_step_menu(ui, format!("{} Thêm bước vào vòng lặp", ic::PLUS)) {
-                        steps.push(new);
-                        if let Some(kind) = kind {
-                            let mut p = path.clone();
-                            p.push(steps.len() - 1);
-                            st.pick_request = Some(PickTarget { path: p, otherwise: false, kind });
-                        }
-                        st.changed = true;
-                    }
-                });
+        if node.is_block() {
+            block_ui(ui, node, path, st, &mut row_buttons);
             ui.add_space(4.0);
             path.pop();
             continue;
@@ -1761,12 +2273,12 @@ fn nodes_ui(ui: &mut egui::Ui, nodes: &mut Vec<Node>, path: &mut Vec<usize>, st:
             ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, number.to_string(), egui::FontId::new(13.0, theme::bold()), TEXT);
             // Buttons first (right to left) so the content takes exactly what is left.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                row_buttons(ui, &mut action);
+                row_buttons(ui);
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                     if node.manual {
                         manual_body(ui, node, st, path, false);
                     } else {
-                        let hint = if in_loop { "vd: chọn ải mới nhất" } else { "vd: bấm xuất chiến góc phải dưới" };
+                        let hint = if in_block { "vd: chọn ải mới nhất" } else { "vd: bấm xuất chiến góc phải dưới" };
                         if step_text_box(ui, ("step-box", number), &mut node.text, hint) {
                             node.step = None;
                             st.changed = true;
@@ -1782,14 +2294,15 @@ fn nodes_ui(ui: &mut egui::Ui, nodes: &mut Vec<Node>, path: &mut Vec<usize>, st:
         // Extras: test, search area, "nếu không thấy thì…".
         let searches = !node.manual || matches!(node.step, Some(Step::TapImage { .. } | Step::WaitImage { .. }));
         let can_fallback = !node.manual || matches!(node.step, Some(Step::TapImage { all: false, .. }));
+        let testable = !matches!(node.step, Some(Step::StopRun));
         ui.horizontal_wrapped(|ui| {
             ui.add_space(30.0);
             let small = |t: String| egui::Button::new(RichText::new(t).size(13.0)).small();
-            if ui.add(small(format!("{} Thử bước này", ic::PLAY))).on_hover_text("Chạy riêng bước này trên giả lập ngay bây giờ").clicked() {
+            if testable && ui.add(small(format!("{} Thử bước này", ic::PLAY))).on_hover_text("Chạy riêng bước này trên giả lập ngay bây giờ").clicked() {
                 st.test_request = Some(node.clone());
             }
             if searches {
-                let picking_this = st.picking.is_some_and(|p| p.path == *path && p.kind == PickKind::Region);
+                let picking_this = st.is_picking(path, Slot::Step, PickKind::Region);
                 let label = match (picking_this, node.region.is_some()) {
                     (true, _) => format!("{} Đang chọn vùng…", ic::SELECTION),
                     (false, true) => format!("{} Vùng tìm ✓", ic::SELECTION),
@@ -1797,7 +2310,7 @@ fn nodes_ui(ui: &mut egui::Ui, nodes: &mut Vec<Node>, path: &mut Vec<usize>, st:
                 };
                 let tip = "Kéo chuột trên ảnh màn hình để chỉ tìm trong vùng đó (tránh nhầm với chỗ khác)";
                 if ui.add(small(label).selected(picking_this || node.region.is_some())).on_hover_text(tip).clicked() {
-                    st.pick_request = Some(PickTarget { path: path.clone(), otherwise: false, kind: PickKind::Region });
+                    st.request(path, Slot::Step, PickKind::Region);
                 }
                 if node.region.is_some() && ui.small_button(ic::X).on_hover_text("Bỏ vùng tìm (tìm cả màn hình)").clicked() {
                     node.region = None;
@@ -1814,7 +2327,7 @@ fn nodes_ui(ui: &mut egui::Ui, nodes: &mut Vec<Node>, path: &mut Vec<usize>, st:
         });
 
         let mut remove_otherwise = false;
-        let mut replace_otherwise: Option<(Node, Option<PickKind>)> = None;
+        let mut replace_otherwise: Option<NewStep> = None;
         if let Some(other) = node.otherwise.as_deref_mut() {
             ui.horizontal_top(|ui| {
                 ui.add_space(30.0);
@@ -1844,9 +2357,7 @@ fn nodes_ui(ui: &mut egui::Ui, nodes: &mut Vec<Node>, path: &mut Vec<usize>, st:
                         }
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("rồi tìm lại, tối đa").size(13.0).color(MUTED));
-                            if ui.add(egui::DragValue::new(&mut node.otherwise_max).range(1..=99)).changed() {
-                                st.changed = true;
-                            }
+                            st.changed |= ui.add(egui::DragValue::new(&mut node.otherwise_max).range(1..=99)).changed();
                             ui.label(RichText::new("lần").size(13.0).color(MUTED));
                         });
                     });
@@ -1857,12 +2368,16 @@ fn nodes_ui(ui: &mut egui::Ui, nodes: &mut Vec<Node>, path: &mut Vec<usize>, st:
             node.otherwise = None;
             st.changed = true;
         }
-        if let Some((new, kind)) = replace_otherwise {
-            node.otherwise = Some(Box::new(new));
-            if let Some(kind) = kind {
-                st.pick_request = Some(PickTarget { path: path.clone(), otherwise: true, kind });
+        if let Some((new, pick)) = replace_otherwise {
+            if new.is_block() {
+                // Blocks can't be a fallback; keep the existing one.
+            } else {
+                node.otherwise = Some(Box::new(new));
+                if let Some((_, kind)) = pick {
+                    st.request(path, Slot::Otherwise, kind);
+                }
+                st.changed = true;
             }
-            st.changed = true;
         }
         ui.add_space(8.0);
         path.pop();
@@ -1878,15 +2393,52 @@ fn nodes_ui(ui: &mut egui::Ui, nodes: &mut Vec<Node>, path: &mut Vec<usize>, st:
     st.changed = true;
 }
 
-fn scenario_card(
-    ui: &mut egui::Ui,
-    sc: &mut Scenario,
-    job: Option<&Job>,
-    instances: &[Instance],
-    selected: bool,
-    actions: &mut Vec<RowAction>,
-) {
-    let running = job.is_some();
+/// Name of the chosen emulators, e.g. "LDPlayer, Acc 2" or "3 giả lập".
+fn targets_label(sc: &Scenario, instances: &[Instance]) -> String {
+    let names: Vec<String> = sc
+        .targets()
+        .iter()
+        .map(|i| instances.iter().find(|x| x.index == *i).map(|x| x.name.clone()).unwrap_or_else(|| format!("#{i}")))
+        .collect();
+    match names.len() {
+        0 => "(chọn giả lập)".into(),
+        1 | 2 => names.join(", "),
+        n => format!("{n} giả lập"),
+    }
+}
+
+/// Checkbox list of emulators; returns true when the choice changed.
+fn targets_menu(ui: &mut egui::Ui, id: &str, sc: &mut Scenario, instances: &[Instance]) -> bool {
+    let mut changed = false;
+    let label = format!("{}  {}  {}", ic::DEVICE_MOBILE, targets_label(sc, instances), ic::CARET_DOWN);
+    ui.push_id(id, |ui| {
+        ui.menu_button(label, |ui| {
+            ui.label(theme::muted("Chạy cùng lúc trên các giả lập:"));
+            let mut chosen = sc.targets();
+            for inst in instances {
+                let mut on = chosen.contains(&inst.index);
+                let text = format!("{}{}", inst.name, if inst.running { "  ● đang mở" } else { "" });
+                if ui.checkbox(&mut on, text).changed() {
+                    if on {
+                        chosen.push(inst.index);
+                    } else {
+                        chosen.retain(|i| *i != inst.index);
+                    }
+                    chosen.sort();
+                    sc.instances = chosen.clone();
+                    if let Some(first) = chosen.first() {
+                        sc.instance_index = *first;
+                    }
+                    changed = true;
+                }
+            }
+        });
+    });
+    changed
+}
+
+fn scenario_card(ui: &mut egui::Ui, sc: &mut Scenario, jobs: &[&Job], instances: &[Instance], selected: bool, actions: &mut Vec<RowAction>) {
+    let running = !jobs.is_empty();
     let border = if selected { ACCENT } else { BORDER };
     let resp = theme::card_frame(border).show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -1908,14 +2460,17 @@ fn scenario_card(
                     if n > 0 {
                         theme::chip(ui, format!("{} AI {n} bước", ic::LIGHTNING), YELLOW);
                     }
+                    if !sc.popups.is_empty() {
+                        theme::chip(ui, format!("{} {} popup", ic::SHIELD_CHECK, sc.popups.len()), MUTED);
+                    }
+                    if sc.recovery.home.is_some() || !sc.recovery.package.is_empty() {
+                        theme::chip(ui, format!("{} tự phục hồi", ic::FIRST_AID), MUTED);
+                    }
                 });
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if running {
-                    if ui
-                        .add(theme::button(format!("{} Dừng", ic::STOP), RED))
-                        .clicked()
-                    {
+                    if ui.add(theme::button(format!("{} Dừng", ic::STOP), RED)).clicked() {
                         actions.push(RowAction::Stop(sc.id.clone()));
                     }
                 } else {
@@ -1924,67 +2479,38 @@ fn scenario_card(
                             actions.push(RowAction::Edit(sc.id.clone()));
                             ui.close();
                         }
-                        if ui
-                            .add_enabled(
-                                sc.recorded,
-                                egui::Button::new(format!(
-                                    "{} Xuất file chia sẻ",
-                                    ic::UPLOAD_SIMPLE
-                                )),
-                            )
-                            .clicked()
-                        {
+                        if ui.add_enabled(sc.recorded, egui::Button::new(format!("{} Xuất file chia sẻ", ic::UPLOAD_SIMPLE))).clicked() {
                             actions.push(RowAction::Export(sc.id.clone()));
                             ui.close();
                         }
-                        if ui
-                            .button(RichText::new(format!("{} Xóa", ic::TRASH)).color(RED))
-                            .clicked()
-                        {
+                        if ui.button(RichText::new(format!("{} Xóa", ic::TRASH)).color(RED)).clicked() {
                             actions.push(RowAction::Delete(sc.id.clone()));
                             ui.close();
                         }
                     });
-                    if ui
-                        .add(theme::button(format!("{} Chạy", ic::PLAY), ACCENT))
-                        .clicked()
-                    {
+                    if ui.add(theme::button(format!("{} Chạy", ic::PLAY), ACCENT)).clicked() {
                         actions.push(RowAction::Start(sc.id.clone()));
                     }
                 }
                 ui.add_space(8.0);
                 ui.add_enabled_ui(!running, |ui| {
-                    let current = instances.iter().find(|i| i.index == sc.instance_index);
-                    let text = current
-                        .map(|i| i.name.clone())
-                        .unwrap_or_else(|| format!("#{}", sc.instance_index));
-                    let before = sc.instance_index;
-                    egui::ComboBox::from_id_salt(("inst", sc.id.as_str()))
-                        .selected_text(format!("{}  {text}", ic::DEVICE_MOBILE))
-                        .width(220.0)
-                        .show_ui(ui, |ui| {
-                            for inst in instances {
-                                let label = format!(
-                                    "{}{}",
-                                    inst.name,
-                                    if inst.running { "  ● đang mở" } else { "" }
-                                );
-                                ui.selectable_value(&mut sc.instance_index, inst.index, label);
-                            }
-                        });
-                    if sc.instance_index != before {
+                    if targets_menu(ui, &sc.id.clone(), sc, instances) {
                         actions.push(RowAction::Save(sc.id.clone()));
                     }
                 });
                 ui.add_space(8.0);
-                match job {
-                    Some(j) => {
+                match jobs {
+                    [] => {
+                        ui.label(theme::muted("Đang tắt"));
+                        theme::status_dot(ui, MUTED);
+                    }
+                    [j] => {
                         ui.label(RichText::new(&j.status).color(GREEN));
                         theme::status_dot(ui, GREEN);
                     }
-                    None => {
-                        ui.label(theme::muted("Đang tắt"));
-                        theme::status_dot(ui, MUTED);
+                    many => {
+                        ui.label(RichText::new(format!("Đang chạy trên {} giả lập", many.len())).color(GREEN));
+                        theme::status_dot(ui, GREEN);
                     }
                 }
             });
