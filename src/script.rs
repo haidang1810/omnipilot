@@ -13,13 +13,22 @@ use serde::{Deserialize, Serialize};
 use crate::paths;
 
 /// What the trial run learned about a step, so later runs need no AI.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Rec {
     /// PNG file (inside the scenario folder) cropped around the element.
     pub template: String,
     /// Top-left corner of the template on the screen when it was recorded.
     pub x: u32,
     pub y: u32,
+    /// How similar the screen must be to count as a match (0..1); None = default 0.88.
+    #[serde(default)]
+    pub threshold: Option<f32>,
+}
+
+impl Rec {
+    pub fn threshold(&self) -> f32 {
+        self.threshold.unwrap_or(crate::vision::MATCH_THRESHOLD)
+    }
 }
 
 fn d_max_tap_all() -> u32 {
@@ -95,6 +104,8 @@ pub enum Step {
     },
     /// End this run successfully (e.g. out of stamina).
     StopRun,
+    /// Sets a variable: a number, plus/minus a number, or the number read in an area.
+    SetVar { name: String, change: VarOp },
     /// Run another saved scenario's steps here ("kịch bản con").
     Call {
         scenario_id: String,
@@ -166,6 +177,47 @@ impl Cmp {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VarOp {
+    Set { value: f64 },
+    Add { value: f64 },
+    /// The first number read inside the area (fractions of the screen).
+    Read { region: [f32; 4] },
+}
+
+/// How long a variable keeps its value.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VarScope {
+    /// Starts at 0 every run.
+    #[default]
+    Run,
+    /// Kept between runs, back to 0 every day (e.g. battles fought today).
+    Day,
+    /// Kept until changed.
+    Forever,
+}
+
+impl VarScope {
+    pub const ALL: [VarScope; 3] = [VarScope::Run, VarScope::Day, VarScope::Forever];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            VarScope::Run => "về 0 mỗi lượt",
+            VarScope::Day => "về 0 mỗi ngày",
+            VarScope::Forever => "giữ mãi",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct VarDef {
+    pub name: String,
+    #[serde(default)]
+    pub scope: VarScope,
+}
+
 /// Something checked on the current screen.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -179,21 +231,28 @@ pub enum Cond {
     /// The first number read inside `region` (fractions of the screen) compares to `value`.
     /// "97/120" reads as 97.
     Number { region: [f32; 4], op: Cmp, value: f64 },
+    /// A variable compares to `value`.
+    Var { name: String, op: Cmp, value: f64 },
 }
 
 impl Cond {
     pub fn new_image() -> Self {
-        Cond::SeeImage { rec: Rec { template: String::new(), x: 0, y: 0 }, region: None }
+        Cond::SeeImage { rec: Rec::default(), region: None }
     }
 
     pub fn new_number() -> Self {
         Cond::Number { region: [0.0; 4], op: Cmp::Lt, value: 10.0 }
     }
 
+    pub fn new_var() -> Self {
+        Cond::Var { name: String::new(), op: Cmp::Ge, value: 10.0 }
+    }
+
     pub fn needs_pick(&self) -> bool {
         match self {
             Cond::SeeImage { rec, .. } => rec.template.is_empty(),
             Cond::Number { region, .. } => region[2] <= region[0],
+            Cond::Var { name, .. } => name.is_empty(),
         }
     }
 
@@ -202,6 +261,7 @@ impl Cond {
             _ if self.needs_pick() => "(chưa chọn trên màn hình)".into(),
             Cond::SeeImage { .. } => "thấy ảnh".into(),
             Cond::Number { op, value, .. } => format!("số trong vùng {} {value}", op.symbol()),
+            Cond::Var { name, op, value } => format!("biến \"{name}\" {} {value}", op.symbol()),
         }
     }
 }
@@ -314,6 +374,12 @@ impl Step {
             Step::Loop { max, until: Some(c), .. } => format!("Lặp tối đa {max} lần, dừng khi {}", c.describe()),
             Step::If { cond, .. } => format!("Nếu {}", cond.describe()),
             Step::StopRun => "Dừng kịch bản (kết thúc lượt này)".into(),
+            Step::SetVar { name, .. } if name.is_empty() => "Chọn biến".into(),
+            Step::SetVar { name, change: VarOp::Set { value } } => format!("Đặt biến \"{name}\" = {value}"),
+            Step::SetVar { name, change: VarOp::Add { value } } if *value < 0.0 => format!("Biến \"{name}\" trừ {}", -value),
+            Step::SetVar { name, change: VarOp::Add { value } } => format!("Biến \"{name}\" cộng {value}"),
+            Step::SetVar { name, change: VarOp::Read { region } } if region[2] <= region[0] => format!("Biến \"{name}\" = số đọc trong vùng (chưa chọn vùng)"),
+            Step::SetVar { name, change: VarOp::Read { .. } } => format!("Biến \"{name}\" = số đọc trong vùng"),
             Step::Call { name, .. } => format!("Chạy kịch bản con \"{name}\""),
             _ if self.needs_pick() => "Chưa chọn vị trí trên màn hình".to_string(),
             Step::TapPoint { x, y } => format!("Bấm điểm ({:.0}%, {:.0}%)", x * 100.0, y * 100.0),
@@ -336,6 +402,8 @@ impl Step {
             Step::TapPoint { x, .. } => *x < 0.0,
             Step::TapImage { rec, .. } | Step::WaitImage { rec, .. } => rec.template.is_empty(),
             Step::Swipe { from, to, .. } => from == to,
+            Step::SetVar { name, change } => name.is_empty() || matches!(change, VarOp::Read { region } if region[2] <= region[0]),
+            Step::Call { scenario_id, .. } => scenario_id.is_empty(),
             _ => false,
         }
     }
@@ -619,6 +687,22 @@ impl Default for Recovery {
     }
 }
 
+/// When a repeating scenario may run, and when it should stop.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Limits {
+    /// "HH:MM" – only run between these times (both empty = any time). May wrap midnight.
+    #[serde(default)]
+    pub from: String,
+    #[serde(default)]
+    pub to: String,
+    /// Stop after this many minutes (0 = no limit).
+    #[serde(default)]
+    pub max_minutes: u32,
+    /// Stop after this many runs (0 = no limit).
+    #[serde(default)]
+    pub max_runs: u32,
+}
+
 /// One run, for the history list.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct HistoryEntry {
@@ -630,6 +714,12 @@ pub struct HistoryEntry {
     /// Screenshot saved when the run failed (file in the history folder).
     #[serde(default)]
     pub screenshot: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct SavedVars {
+    date: String,
+    values: std::collections::HashMap<String, f64>,
 }
 
 const HISTORY_KEEP: usize = 100;
@@ -671,6 +761,17 @@ pub struct Scenario {
     pub popups: Vec<PopupRule>,
     #[serde(default)]
     pub recovery: Recovery,
+    #[serde(default)]
+    pub limits: Limits,
+    /// Close the emulator when the scenario has nothing to do for a while
+    /// (after a "Chạy 1 lần", after each daily run, or when the limits are reached).
+    #[serde(default)]
+    pub close_emulator_after: bool,
+    #[serde(default)]
+    pub variables: Vec<VarDef>,
+    /// Start this scenario as soon as the app opens (e.g. after Windows starts).
+    #[serde(default)]
+    pub auto_start: bool,
     pub schedule: Schedule,
     pub steps: Vec<Node>,
     /// True once a trial run was confirmed by the user.
@@ -689,6 +790,10 @@ impl Scenario {
             instances: Vec::new(),
             popups: Vec::new(),
             recovery: Recovery::default(),
+            limits: Limits::default(),
+            close_emulator_after: false,
+            variables: Vec::new(),
+            auto_start: false,
             schedule: Schedule::Repeat { pause_minutes: 0 },
             steps: vec![Node::new()],
             recorded: false,
@@ -713,6 +818,44 @@ impl Scenario {
     /// The emulators to run on (older files only have `instance_index`).
     pub fn targets(&self) -> Vec<u32> {
         if self.instances.is_empty() { vec![self.instance_index] } else { self.instances.clone() }
+    }
+
+    /// Variables kept between runs ("về 0 mỗi ngày" / "giữ mãi"), per emulator.
+    pub fn load_vars(&self, instance: u32) -> std::collections::HashMap<String, f64> {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let saved: SavedVars = fs::read_to_string(self.vars_file(instance))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        self.variables
+            .iter()
+            .filter_map(|v| {
+                let keep = match v.scope {
+                    VarScope::Run => false,
+                    VarScope::Day => saved.date == today,
+                    VarScope::Forever => true,
+                };
+                keep.then(|| saved.values.get(&v.name).map(|n| (v.name.clone(), *n))).flatten()
+            })
+            .collect()
+    }
+
+    pub fn save_vars(&self, instance: u32, values: &std::collections::HashMap<String, f64>) {
+        let keep: std::collections::HashMap<String, f64> = self
+            .variables
+            .iter()
+            .filter(|v| v.scope != VarScope::Run)
+            .filter_map(|v| values.get(&v.name).map(|n| (v.name.clone(), *n)))
+            .collect();
+        let saved = SavedVars { date: chrono::Local::now().format("%Y-%m-%d").to_string(), values: keep };
+        if let Ok(json) = serde_json::to_string_pretty(&saved) {
+            let _ = fs::create_dir_all(self.dir());
+            let _ = fs::write(self.vars_file(instance), json);
+        }
+    }
+
+    fn vars_file(&self, instance: u32) -> PathBuf {
+        self.dir().join(format!("vars_{instance}.json"))
     }
 
     pub fn history_dir(&self) -> PathBuf {

@@ -103,6 +103,37 @@ pub fn list_instances(ld_dir: &Path) -> Result<Vec<Instance>> {
         .collect())
 }
 
+pub fn quit_instance(ld_dir: &Path, index: u32) -> Result<()> {
+    run(&ld_dir.join("ldconsole.exe"), &["quit", "--index", &index.to_string()])?;
+    Ok(())
+}
+
+/// Opens the emulator unless it is already running.
+pub fn launch_if_closed(ld_dir: &Path, instance: &Instance) -> Result<()> {
+    let running = list_instances(ld_dir)?.iter().any(|i| i.index == instance.index && i.running);
+    if !running {
+        launch_instance(ld_dir, instance.index)?;
+    }
+    Ok(())
+}
+
+/// Lays the open emulator windows out side by side.
+pub fn sort_windows(ld_dir: &Path) -> Result<()> {
+    run(&ld_dir.join("ldconsole.exe"), &["sortWnd"])?;
+    Ok(())
+}
+
+/// Installed RAM in GB, to suggest how many emulators can run at once (~4GB each).
+pub fn total_ram_gb() -> u64 {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return 8;
+    }
+    (m.ullTotalPhys as f64 / 1024f64.powi(3)).round() as u64
+}
+
 pub fn launch_instance(ld_dir: &Path, index: u32) -> Result<()> {
     run(
         &ld_dir.join("ldconsole.exe"),

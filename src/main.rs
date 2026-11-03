@@ -3,9 +3,11 @@
 mod ai;
 mod app;
 mod cli;
+mod desktop;
 mod device;
 mod executor;
 mod jobs;
+mod ocr;
 mod paths;
 mod script;
 mod setup;
@@ -28,15 +30,15 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
-    if args.len() == 4 && args[1] == "--job" {
-        if let Err(e) = cli::job(args[2].parse().unwrap_or(0), &args[3]) {
+    if args.len() >= 4 && args[1] == "--job" {
+        if let Err(e) = cli::job(args[2].parse().unwrap_or(0), &args[3..]) {
             eprintln!("Lỗi: {e:#}");
             std::process::exit(1);
         }
         return Ok(());
     }
-    if args.len() == 4 && args[1] == "--run" {
-        if let Err(e) = cli::run_saved(args[2].parse().unwrap_or(0), &args[3]) {
+    if args.len() >= 4 && args[1] == "--run" {
+        if let Err(e) = cli::run_saved(args[2].parse().unwrap_or(0), &args[3], &args[4..]) {
             eprintln!("Lỗi: {e:#}");
             std::process::exit(1);
         }
@@ -49,8 +51,19 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
+    if args.len() == 3 && args[1] == "--autostart" {
+        let on = args[2] == "on";
+        match desktop::set_autostart(on) {
+            Ok(()) => println!("Khởi động cùng Windows: {}", desktop::autostart_enabled()),
+            Err(e) => eprintln!("Lỗi: {e:#}"),
+        }
+        return Ok(());
+    }
+    // Started with Windows: stay in the tray.
+    let tray = args.iter().any(|a| a == "--tray");
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
+            .with_visible(!tray)
             .with_title("OmniPilot")
             .with_inner_size([1200.0, 780.0])
             .with_min_inner_size([900.0, 600.0]),

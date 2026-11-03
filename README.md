@@ -37,6 +37,23 @@ Không cần cắt ảnh nút, không cần ghi tọa độ. AI chạy ngay trê
 3. Ở màn hình chính: chọn **một hoặc nhiều giả lập** cho kịch bản (mỗi giả lập một tài khoản, chạy cùng lúc), bấm **Chạy**. Nút **Dừng tất cả** ở trên cùng.
 4. Bấm vào một kịch bản để xem nhật ký và màn hình từng giả lập, hoặc tab **Lịch sử**: các lượt đã chạy, lỗi gì, ảnh màn hình lúc lỗi.
 
+### Treo máy dài ngày
+
+- **Khay hệ thống**: bấm ✕ thì app ẩn xuống khay, kịch bản vẫn chạy. Chuột phải icon để mở lại, dừng tất cả hoặc thoát hẳn.
+- **Cài đặt → Khởi động cùng Windows**; kịch bản bật **Tự chạy khi mở app** sẽ tự bắt đầu. Máy không tự ngủ khi đang có kịch bản chạy.
+- **Ctrl+F12** ở bất kỳ đâu: dừng tất cả.
+- **Khung giờ, giới hạn** (kiểu lặp liên tục): chỉ chạy từ … đến …, dừng sau N phút hoặc N lượt.
+- **Nhiều kịch bản trên một giả lập** chạy lần lượt; kịch bản theo giờ được ưu tiên chen vào giữa các lượt của kịch bản lặp.
+- **Giả lập**: mở/tắt, sắp xếp cửa sổ; giới hạn số giả lập chạy cùng lúc (tự động theo RAM, ~4GB mỗi cái); kịch bản có thể tự mở giả lập trước giờ chạy và **tắt giả lập khi xong**.
+
+### Sửa kịch bản nhanh
+
+- **Kiểm tra ảnh mẫu**: tìm mọi ảnh nút của kịch bản trên màn hình hiện tại, biết ngay ảnh nào hết khớp sau khi game cập nhật.
+- **Độ giống** từng ảnh (mặc định 88%) và nút **Thử khớp**.
+- **Chạy từ đây** / **Dừng trước bước này** ở từng bước.
+- **Biến**: đếm số trận, lưu số đọc được; giữ trong lượt, trong ngày hoặc mãi mãi. Bước **Đặt biến** và điều kiện **Nếu biến …**.
+- **Đọc số nhanh không cần AI** (OCR PaddleOCR, ~10ms): dùng cho "số trong vùng" và "đặt biến = số đọc được". OCR này không có dấu tiếng Việt nên chỉ đọc số/chữ không dấu; không ra số thì app tự nhờ AI.
+
 ### Chia sẻ kịch bản
 
 - **⋮ → Xuất file chia sẻ**: lưu kịch bản thành file `.omnipilot` (gồm các bước + ảnh mẫu nút).
@@ -81,6 +98,12 @@ omnipilot.exe --cli <số thứ tự giả lập> "vô túi đồ" "thoát ra"
 omnipilot.exe --run <số thứ tự giả lập> "%LOCALAPPDATA%\OmniPilot\scenarios\<id>"
 # Chạy y như nút Chạy (lịch, tự phục hồi, chạy lại, lịch sử) và in trạng thái
 omnipilot.exe --job <số thứ tự giả lập> "%LOCALAPPDATA%\OmniPilot\scenarios\<id>"
+# Nhiều kịch bản cùng lúc trên một giả lập (thử hàng đợi)
+omnipilot.exe --job <số thứ tự giả lập> <thư mục 1> <thư mục 2>
+# Chạy từ bước / dừng trước bước (đường dẫn bước tính từ 0, vd 3.0.0 = bước đầu trong khối thứ 4)
+omnipilot.exe --run <số thứ tự giả lập> <thư mục kịch bản> from=3.0.0 stop=4
+# Bật/tắt khởi động cùng Windows
+omnipilot.exe --autostart on
 # Mở thẳng màn hình tạo kịch bản với ví dụ mẫu
 omnipilot.exe --demo
 ```
@@ -95,7 +118,9 @@ omnipilot.exe --demo
 | `src/ai.rs` | Bật/tắt llama-server, tìm nút, dịch mô tả thành các bước |
 | `src/executor.rs` | Chạy các bước: AI ở lần chạy thử, ảnh mẫu ở các lần sau |
 | `src/vision.rs` | So khớp ảnh mẫu, phát hiện màn hình đổi |
-| `src/jobs.rs` | Lịch chạy (lặp / theo giờ) |
+| `src/ocr.rs` | Đọc số nhanh bằng PaddleOCR (ONNX) |
+| `src/desktop.rs` | Khay hệ thống, phím tắt, khởi động cùng Windows |
+| `src/jobs.rs` | Lịch chạy, khung giờ, hàng đợi giả lập, giới hạn RAM, tự phục hồi, lịch sử |
 | `src/device.rs` | LDPlayer + adb |
 | `src/script.rs` | Kịch bản, lưu, xuất/nhập |
 

@@ -51,13 +51,20 @@ impl Integral {
     }
 }
 
-/// Finds `tpl` on `screen`. Searches around `near` (top-left, full-res pixels) first,
-/// then the whole screen. Returns the full-res top-left corner and the score.
-pub fn find(
-    screen: &RgbaImage,
-    tpl: &RgbaImage,
-    near: Option<(u32, u32)>,
-) -> Option<(u32, u32, f32)> {
+/// Finds `tpl` on `screen` with at least `threshold` similarity. Searches around `near`
+/// (top-left, full-res pixels) first, then the whole screen.
+/// Returns the full-res top-left corner and the score.
+pub fn find(screen: &RgbaImage, tpl: &RgbaImage, near: Option<(u32, u32)>, threshold: f32) -> Option<(u32, u32, f32)> {
+    search(screen, tpl, near, threshold).filter(|m| m.2 >= threshold)
+}
+
+/// The most similar place on the whole screen, however poor (for "kiểm tra ảnh mẫu").
+pub fn best(screen: &RgbaImage, tpl: &RgbaImage) -> Option<(u32, u32, f32)> {
+    search(screen, tpl, None, f32::MAX)
+}
+
+/// Best match; stops after the area around `near` if that already reaches `good_enough`.
+fn search(screen: &RgbaImage, tpl: &RgbaImage, near: Option<(u32, u32)>, good_enough: f32) -> Option<(u32, u32, f32)> {
     let s = half_gray(screen);
     let t = half_gray(tpl);
     let (sw, sh, tw, th) = (
@@ -122,12 +129,12 @@ pub fn find(
             (cx + r).min(max_x),
             (cy + r).min(max_y),
         );
-        if best.2 >= MATCH_THRESHOLD {
+        if best.2 >= good_enough {
             return Some((best.0 as u32 * SCALE, best.1 as u32 * SCALE, best.2));
         }
     }
     let best = search(0, 0, max_x, max_y);
-    (best.2 >= MATCH_THRESHOLD).then(|| (best.0 as u32 * SCALE, best.1 as u32 * SCALE, best.2))
+    Some((best.0 as u32 * SCALE, best.1 as u32 * SCALE, best.2))
 }
 
 /// Whether the screen really changed (new screen or popup), ignoring idle animations.

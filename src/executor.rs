@@ -15,7 +15,7 @@ use image::RgbaImage;
 
 use crate::ai::{AiServer, Query, Rect};
 use crate::device::{self, Device, Frame, Instance};
-use crate::script::{self, Cond, Node, PopupAction, PopupRule, Rec, Step};
+use crate::script::{self, Cond, Node, PopupAction, PopupRule, Rec, Step, VarOp};
 use crate::vision;
 
 pub type SharedAi = Arc<Mutex<Option<AiServer>>>;
@@ -37,6 +37,16 @@ impl std::fmt::Display for NotFound {
     }
 }
 impl std::error::Error for NotFound {}
+
+/// The run reached the step the user asked to stop before ("Dừng trước bước này").
+#[derive(Debug)]
+pub struct Paused;
+impl std::fmt::Display for Paused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "đã dừng trước bước đã chọn")
+    }
+}
+impl std::error::Error for Paused {}
 
 /// "Dừng kịch bản": the run ends here, successfully.
 #[derive(Debug)]
@@ -79,6 +89,14 @@ pub struct Runner {
     pub popup_dir: PathBuf,
     /// Nesting of kịch bản con, to stop a scenario that calls itself.
     depth: u32,
+    /// Variables of this run (the job loads/saves the ones kept between runs).
+    pub vars: std::collections::HashMap<String, f64>,
+    /// "Chạy từ đây": skip everything before this step path (see `node_at` in the UI).
+    pub start_at: Option<Vec<usize>>,
+    /// "Dừng trước bước này": stop when reaching this step path.
+    pub stop_before: Option<Vec<usize>>,
+    /// Path of the step being run.
+    path: Vec<usize>,
 }
 
 const TAP_SETTLE: Duration = Duration::from_millis(1500);
@@ -193,15 +211,35 @@ impl Runner {
                 Ok(seen)
             }
             Cond::Number { region, op, value } => {
-                let frame = self.shot()?;
-                let crop = crop_fraction(&frame.img, *region);
-                let text = self.with_ai(|ai| ai.read_text_plain(&crop))?;
-                let n = first_number(&text).ok_or_else(|| anyhow!("không đọc được số trong vùng (AI đọc: \"{}\")", text.trim()))?;
+                let n = self.read_number(*region)?;
                 let ok = op.test(n, *value);
                 self.log(format!("  → đọc được {n}, {n} {} {value}: {}", op.symbol(), if ok { "đúng" } else { "sai" }));
                 Ok(ok)
             }
+            Cond::Var { name, op, value } => {
+                let n = self.vars.get(name).copied().unwrap_or(0.0);
+                let ok = op.test(n, *value);
+                self.log(format!("  → biến \"{name}\" = {n}, {n} {} {value}: {}", op.symbol(), if ok { "đúng" } else { "sai" }));
+                Ok(ok)
+            }
         }
+    }
+
+    /// The first number in an area: fast OCR (~10ms), the AI only if OCR finds no digits.
+    fn read_number(&mut self, region: [f32; 4]) -> Result<f64> {
+        let frame = self.shot()?;
+        let crop = crop_fraction(&frame.img, region);
+        match crate::ocr::read_line(&crop) {
+            Ok(text) => {
+                if let Some(n) = first_number(&text) {
+                    return Ok(n);
+                }
+                self.log(format!("  OCR đọc \"{text}\" không thấy số, nhờ AI đọc lại"));
+            }
+            Err(e) => self.log(format!("  OCR lỗi ({e:#}), nhờ AI đọc")),
+        }
+        let text = self.with_ai(|ai| ai.read_text_plain(&crop))?;
+        first_number(&text).ok_or_else(|| anyhow!("không đọc được số trong vùng (đọc được: \"{}\")", text.trim()))
     }
 
     /// Before a run: opens the game if it is not on screen.
@@ -271,15 +309,35 @@ impl Runner {
         self.wait_home(r, home_dir, Duration::from_secs(120))
     }
 
-    /// Runs a node list as a whole scenario: "Dừng kịch bản" counts as success.
+    /// Runs a node list as a whole scenario: "Dừng kịch bản" and reaching the chosen
+    /// "dừng trước bước này" both count as success.
     pub fn run_all(&mut self, nodes: &mut [Node]) -> Result<()> {
+        self.path.clear();
         match self.run(nodes) {
             Err(e) if e.downcast_ref::<Finished>().is_some() => {
                 self.log("Kịch bản tự dừng.");
                 Ok(())
             }
+            Err(e) if e.downcast_ref::<Paused>().is_some() => {
+                self.log("Đã dừng trước bước đã chọn.");
+                Ok(())
+            }
             r => r,
         }
+    }
+
+    /// Whether `start_at` says to skip the step at the current path.
+    fn skipping(&self) -> bool {
+        let Some(target) = &self.start_at else { return false };
+        // Skip whatever comes before the target in reading order.
+        let n = self.path.len().min(target.len());
+        self.path[..n] < target[..n]
+    }
+
+    /// The child list ("thì"/"không thì") to enter because `start_at` points inside it.
+    fn start_branch(&self) -> Option<usize> {
+        let target = self.start_at.as_ref()?;
+        (target.len() > self.path.len() + 1 && target.starts_with(&self.path)).then(|| target[self.path.len()])
     }
 
     fn save_template(&self, frame: &Frame, rect: Rect) -> Result<Rec> {
@@ -288,11 +346,7 @@ impl Runner {
         image::imageops::crop_imm(&frame.img, rect.x, rect.y, rect.w, rect.h)
             .to_image()
             .save(self.dir.join(&name))?;
-        Ok(Rec {
-            template: name,
-            x: rect.x,
-            y: rect.y,
-        })
+        Ok(Rec { template: name, x: rect.x, y: rect.y, threshold: None })
     }
 
     fn match_template(&self, frame: &Frame, rec: &Rec) -> Option<Rect> {
@@ -377,15 +431,40 @@ impl Runner {
     }
 
     pub fn run(&mut self, nodes: &mut [Node]) -> Result<()> {
-        for node in nodes.iter_mut() {
-            self.check_stop()?;
-            self.handle_popups()?;
-            if !node.is_block() {
-                self.log(format!("▸ {}", label(node)));
-            }
-            self.run_node(node)?;
+        for (i, node) in nodes.iter_mut().enumerate() {
+            self.path.push(i);
+            let result = self.run_at(node);
+            self.path.pop();
+            result?;
         }
         Ok(())
+    }
+
+    fn run_at(&mut self, node: &mut Node) -> Result<()> {
+        if self.skipping() {
+            return Ok(());
+        }
+        if self.start_at.as_ref() == Some(&self.path) {
+            self.start_at = None;
+            self.log("— Bắt đầu chạy từ bước này");
+        }
+        if self.stop_before.as_ref() == Some(&self.path) {
+            return Err(Paused.into());
+        }
+        self.check_stop()?;
+        self.handle_popups()?;
+        if !node.is_block() {
+            self.log(format!("▸ {}", label(node)));
+        }
+        self.run_node(node)
+    }
+
+    /// Runs one child list of a block (0 = loop body / "thì", 1 = "không thì").
+    fn run_branch(&mut self, branch: usize, nodes: &mut [Node]) -> Result<()> {
+        self.path.push(branch);
+        let result = self.run(nodes);
+        self.path.pop();
+        result
     }
 
     /// Runs a step; when it finds nothing and the node has a "nếu không thấy thì…" action,
@@ -523,9 +602,26 @@ impl Runner {
                 self.sleep(TAP_SETTLE)
             }
             Step::If { cond, then_steps, else_steps } => {
-                self.log(format!("▸ Nếu {}", cond.describe()));
-                let yes = self.check(cond)?;
-                self.run(if yes { then_steps } else { else_steps })
+                // "Chạy từ đây" pointing inside a branch enters that branch directly.
+                let yes = match self.start_branch() {
+                    Some(b) => b == 0,
+                    None => {
+                        self.log(format!("▸ Nếu {}", cond.describe()));
+                        self.check(cond)?
+                    }
+                };
+                if yes { self.run_branch(0, then_steps) } else { self.run_branch(1, else_steps) }
+            }
+            Step::SetVar { name, change } => {
+                let before = self.vars.get(name.as_str()).copied().unwrap_or(0.0);
+                let after = match change {
+                    VarOp::Set { value } => *value,
+                    VarOp::Add { value } => before + *value,
+                    VarOp::Read { region } => self.read_number(*region)?,
+                };
+                self.vars.insert(name.clone(), after);
+                self.log(format!("  biến \"{name}\" = {after}"));
+                Ok(())
             }
             Step::StopRun => Err(Finished.into()),
             Step::Call { scenario_id, name } => {
@@ -538,23 +634,30 @@ impl Runner {
                     .ok_or_else(|| anyhow!("không tìm thấy kịch bản con \"{name}\" (đã bị xóa?)"))?;
                 self.log(format!("— Vào kịch bản con \"{}\"", sub.name));
                 let parent_dir = std::mem::replace(&mut self.dir, sub.dir());
+                // Step paths refer to this scenario, not to the one called.
+                let parent_path = std::mem::take(&mut self.path);
+                let (start, stop) = (self.start_at.take(), self.stop_before.take());
                 self.depth += 1;
                 let result = self.run(&mut sub.steps);
                 self.depth -= 1;
                 self.dir = parent_dir;
+                self.path = parent_path;
+                (self.start_at, self.stop_before) = (start, stop);
                 self.log(format!("— Xong kịch bản con \"{}\"", sub.name));
                 result
             }
             Step::Loop { max, steps, until } => {
                 for i in 0..*max {
-                    if let Some(c) = until {
+                    // Entering the loop through "chạy từ đây": no stop check on that first round.
+                    let resuming = self.start_branch().is_some();
+                    if let (Some(c), false) = (until.as_ref(), resuming) {
                         if self.check(c)? {
                             self.log("Điều kiện dừng vòng lặp đã đúng");
                             break;
                         }
                     }
                     self.log(format!("— Vòng {}/{}", i + 1, max));
-                    match self.run(steps) {
+                    match self.run_branch(0, steps) {
                         Ok(()) => {}
                         Err(e) if e.downcast_ref::<NotFound>().is_some() => {
                             self.log(format!("Kết thúc vòng lặp ({e})"));
@@ -647,7 +750,7 @@ fn label(node: &Node) -> String {
 
 fn match_in(dir: &Path, frame: &Frame, rec: &Rec) -> Option<Rect> {
     let tpl = image::open(dir.join(&rec.template)).ok()?.to_rgba8();
-    let (x, y, _) = vision::find(&frame.img, &tpl, Some((rec.x, rec.y)))?;
+    let (x, y, _) = vision::find(&frame.img, &tpl, Some((rec.x, rec.y)), rec.threshold())?;
     Some(Rect { x, y, w: tpl.width(), h: tpl.height() })
 }
 
@@ -706,5 +809,9 @@ pub fn new_runner(
         popups: Vec::new(),
         popup_dir: PathBuf::new(),
         depth: 0,
+        vars: Default::default(),
+        start_at: None,
+        stop_before: None,
+        path: Vec::new(),
     }
 }

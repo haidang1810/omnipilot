@@ -34,8 +34,30 @@ pub fn mmproj_path() -> PathBuf {
     paths::models_dir().join(MMPROJ_FILE)
 }
 
+const OCR_REPO: &str = "monkt/paddleocr-onnx";
+
+pub fn ocr_model_path() -> PathBuf {
+    paths::models_dir().join("ocr").join("latin_rec.onnx")
+}
+
+pub fn ocr_dict_path() -> PathBuf {
+    paths::models_dir().join("ocr").join("latin_dict.txt")
+}
+
 fn assets() -> Vec<Asset> {
     vec![
+        Asset {
+            label: "Bộ đọc số nhanh (OCR)",
+            url: format!("https://huggingface.co/{OCR_REPO}/resolve/main/languages/latin/rec.onnx"),
+            dest: ocr_model_path(),
+            extract_to: None,
+        },
+        Asset {
+            label: "Bảng chữ của OCR",
+            url: format!("https://huggingface.co/{OCR_REPO}/resolve/main/languages/latin/dict.txt"),
+            dest: ocr_dict_path(),
+            extract_to: None,
+        },
         Asset {
             label: "AI runtime (llama.cpp)",
             url: format!(
@@ -60,7 +82,7 @@ fn assets() -> Vec<Asset> {
 }
 
 pub fn is_ready() -> bool {
-    llama_server_exe().exists() && model_path().exists() && mmproj_path().exists()
+    llama_server_exe().exists() && model_path().exists() && mmproj_path().exists() && ocr_model_path().exists() && ocr_dict_path().exists()
 }
 
 #[derive(Default, Clone)]

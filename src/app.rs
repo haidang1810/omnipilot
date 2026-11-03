@@ -17,9 +17,33 @@ use crate::script::{self, Cond, Node, Scenario, Schedule, Step};
 use crate::theme::{self, ACCENT, BORDER, CARD_HI, GREEN, MUTED, PANEL, RED, TEXT, YELLOW};
 use crate::{paths, setup};
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize)]
 struct Settings {
     ld_dir: Option<PathBuf>,
+    /// Closing the window hides it in the tray (runs go on).
+    #[serde(default = "yes")]
+    close_to_tray: bool,
+    /// Ctrl+F12 stops everything, from any program.
+    #[serde(default = "yes")]
+    hotkey: bool,
+    /// Emulators running a scenario at once; 0 = automatic (about 4GB of RAM each).
+    #[serde(default)]
+    max_parallel: usize,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { ld_dir: None, close_to_tray: true, hotkey: true, max_parallel: 0 }
+    }
+}
+
+/// How many emulators may run at once: the user's choice, or ~4GB of RAM each.
+fn effective_parallel(s: &Settings) -> usize {
+    if s.max_parallel > 0 { s.max_parallel } else { ((device::total_ram_gb() / 4) as usize).max(1) }
 }
 
 impl Settings {
@@ -81,6 +105,8 @@ struct ScreenView {
     shown_gen: u64,
     /// Start and current pointer position while dragging.
     drag: Option<(egui::Pos2, egui::Pos2)>,
+    /// Boxes drawn on top (fractions of the screen), e.g. "thử khớp" results.
+    marks: Vec<([f32; 4], Color32, String)>,
 }
 
 impl ScreenView {
@@ -93,6 +119,7 @@ impl ScreenView {
         self.img = Some(img.clone());
         self.size = [img.width(), img.height()];
         self.tap = tap;
+        self.marks.clear();
     }
 
     /// Draws the screen with the last tap and `region` on top. With `pick`, the user
@@ -127,6 +154,11 @@ impl ScreenView {
             let p = rect.min + vec2(x as f32 / self.size[0] as f32 * size.x, y as f32 / self.size[1] as f32 * size.y);
             painter.circle_stroke(p, 13.0, egui::Stroke::new(3.0_f32, RED));
             painter.circle_filled(p, 3.5, RED);
+        }
+        for (f, color, label) in &self.marks {
+            let r = to_screen(*f);
+            painter.rect_stroke(r, 3, egui::Stroke::new(2.0_f32, *color), egui::StrokeKind::Outside);
+            painter.text(r.left_bottom() + vec2(0.0, 2.0), egui::Align2::LEFT_TOP, label, egui::FontId::new(12.0, theme::bold()), *color);
         }
         let Some(kind) = pick else {
             self.drag = None;
@@ -233,6 +265,71 @@ enum Slot {
     PopupPoint(usize),
     /// The start screen used by recovery.
     Home,
+    /// The area read by an "Đặt biến = số trong vùng" step.
+    VarRegion,
+}
+
+/// One saved picture checked against the current screenshot.
+struct CheckResult {
+    label: String,
+    template: String,
+    threshold: f32,
+    /// Best similarity found and where (fractions of the screen).
+    score: f32,
+    at: Option<[f32; 4]>,
+}
+
+/// Every saved picture of a scenario, named like the editor shows it ("Bước 3", "Popup 1"…).
+fn template_refs(sc: &Scenario) -> Vec<(String, script::Rec)> {
+    fn walk(nodes: &[Node], n: &mut usize, out: &mut Vec<(String, script::Rec)>) {
+        for node in nodes {
+            match &node.step {
+                Some(s) if s.is_block() => {
+                    let cond = match s {
+                        Step::If { cond, .. } => Some(("khối Nếu", cond)),
+                        Step::Loop { until: Some(c), .. } => Some(("dừng vòng lặp", c)),
+                        _ => None,
+                    };
+                    if let Some((what, Cond::SeeImage { rec, .. })) = cond {
+                        if !rec.template.is_empty() {
+                            out.push((format!("Điều kiện {what} (sau bước {n})"), rec.clone()));
+                        }
+                    }
+                    for list in s.children() {
+                        walk(list, n, out);
+                    }
+                }
+                step => {
+                    *n += 1;
+                    let rec = match step {
+                        Some(s) => s.image().cloned().or(match s {
+                            Step::Tap { rec, .. } | Step::TapAll { rec, .. } | Step::WaitUntil { rec, .. } => rec.clone(),
+                            _ => None,
+                        }),
+                        None => None,
+                    };
+                    if let Some(r) = rec {
+                        out.push((format!("Bước {n}"), r));
+                    }
+                    if let Some(r) = node.otherwise.as_ref().and_then(|o| o.step.as_ref()).and_then(|s| s.image()) {
+                        out.push((format!("Bước {n} · nếu không thấy"), r.clone()));
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&sc.steps, &mut 0, &mut out);
+    for (i, p) in sc.popups.iter().enumerate() {
+        if !p.rec.template.is_empty() {
+            let name = if p.note.trim().is_empty() { String::new() } else { format!(" ({})", p.note.trim()) };
+            out.push((format!("Popup {}{name}", i + 1), p.rec.clone()));
+        }
+    }
+    if let Some(h) = &sc.recovery.home {
+        out.push(("Màn hình gốc".into(), h.clone()));
+    }
+    out
 }
 
 struct Task {
@@ -261,6 +358,11 @@ struct Editor {
     picking: Option<PickTarget>,
     /// A screenshot being taken (for picking).
     shot_rx: Option<Receiver<Result<RgbaImage, String>>>,
+    /// "Dừng trước bước này" for runs started from the editor.
+    breakpoint: Option<Vec<usize>>,
+    /// "Kiểm tra ảnh mẫu" results, and the check running in the background.
+    checks: Vec<CheckResult>,
+    checks_rx: Option<Receiver<Vec<CheckResult>>>,
     /// Games installed on the emulator (for "mở lại game").
     packages: Vec<String>,
     packages_rx: Option<Receiver<Result<Vec<String>, String>>>,
@@ -290,6 +392,9 @@ impl Editor {
             error: None,
             picking: None,
             shot_rx: None,
+            breakpoint: None,
+            checks: Vec::new(),
+            checks_rx: None,
             packages: Vec::new(),
             packages_rx: None,
             thumbs: ThumbCache::default(),
@@ -336,6 +441,7 @@ impl Editor {
         let (ai, dir, stop2) = (self.ai.clone(), self.sc.dir(), stop.clone());
         let popups = self.sc.popups.clone();
         let mut nodes = self.sc.steps.clone();
+        let breakpoint = self.breakpoint.clone();
         std::thread::spawn(move || {
             let r = (|| -> anyhow::Result<(Vec<Node>, Option<[u32; 2]>)> {
                 let log_tx = tx.clone();
@@ -355,6 +461,7 @@ impl Editor {
                 let mut runner = executor::new_runner(&ld, inst, dir.clone(), ai, true, stop2, etx);
                 runner.popups = popups;
                 runner.popup_dir = dir;
+                runner.stop_before = breakpoint;
                 runner.ensure_device()?;
                 runner.run_all(&mut nodes)?;
                 Ok((nodes, runner.screen_size))
@@ -415,7 +522,7 @@ impl Editor {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let name = format!("tpl_{}.png", uuid::Uuid::new_v4().simple());
         image::imageops::crop_imm(img, x, y, cw, ch).to_image().save(dir.join(&name)).map_err(|e| e.to_string())?;
-        Ok(script::Rec { template: name, x, y })
+        Ok(script::Rec { template: name, x, y, threshold: None })
     }
 
     /// Applies a finished pick to what it was for.
@@ -430,6 +537,13 @@ impl Editor {
                 self.sc.popups.get_mut(i).ok_or("Quy tắc này không còn nữa")?.action = script::PopupAction::TapPoint { x, y };
             }
             (Slot::Home, Picked::Rect(r)) => self.sc.recovery.home = Some(self.save_crop(r)?),
+            (Slot::VarRegion, Picked::Rect(r)) => {
+                let node = node_at(&mut self.sc.steps, &target.path).ok_or("Bước này không còn nữa")?;
+                match &mut node.step {
+                    Some(Step::SetVar { change: script::VarOp::Read { region }, .. }) => *region = r,
+                    _ => return Err(mismatch()),
+                }
+            }
             (Slot::Cond, picked) => {
                 let rec = match (&picked, target.kind) {
                     (Picked::Rect(r), PickKind::Image) => Some(self.save_crop(*r)?),
@@ -490,6 +604,99 @@ impl Editor {
         self.shot_rx = Some(rx);
     }
 
+    /// "Thử khớp": finds one picture on the current screenshot and boxes it.
+    fn test_match(&mut self, rec: &script::Rec) {
+        let Some(screen) = self.screen.img.clone() else {
+            self.error = Some("Chụp màn hình giả lập trước đã".into());
+            return;
+        };
+        let Ok(tpl) = image::open(self.sc.dir().join(&rec.template)) else { return };
+        let tpl = tpl.to_rgba8();
+        let (w, h) = (screen.width() as f32, screen.height() as f32);
+        match crate::vision::best(&screen, &tpl) {
+            Some((x, y, score)) => {
+                let ok = score >= rec.threshold();
+                let f = [x as f32 / w, y as f32 / h, (x + tpl.width()) as f32 / w, (y + tpl.height()) as f32 / h];
+                self.screen.marks = vec![(f, if ok { GREEN } else { RED }, format!("{:.0}%", score * 100.0))];
+                jobs::push_log(&mut self.log, format!(
+                    "Thử khớp: giống nhất {:.0}% (cần ≥ {:.0}%) → {}",
+                    score * 100.0,
+                    rec.threshold() * 100.0,
+                    if ok { "khớp" } else { "KHÔNG khớp" }
+                ));
+            }
+            None => jobs::push_log(&mut self.log, "Thử khớp: ảnh mẫu lớn hơn màn hình hoặc không có chi tiết".into()),
+        }
+    }
+
+    /// "Kiểm tra ảnh mẫu": every saved picture against the current screenshot, in the background.
+    fn check_templates(&mut self) {
+        let Some(screen) = self.screen.img.clone() else {
+            self.error = Some("Chụp màn hình giả lập trước đã".into());
+            return;
+        };
+        let refs = template_refs(&self.sc);
+        let dir = self.sc.dir();
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let (w, h) = (screen.width() as f32, screen.height() as f32);
+            let results = refs
+                .into_iter()
+                .map(|(label, rec)| {
+                    let found = image::open(dir.join(&rec.template)).ok().and_then(|t| {
+                        let t = t.to_rgba8();
+                        crate::vision::best(&screen, &t).map(|(x, y, sc)| (sc, [x as f32 / w, y as f32 / h, (x + t.width()) as f32 / w, (y + t.height()) as f32 / h]))
+                    });
+                    CheckResult {
+                        label,
+                        template: rec.template.clone(),
+                        threshold: rec.threshold(),
+                        score: found.map(|f| f.0).unwrap_or(0.0),
+                        at: found.map(|f| f.1),
+                    }
+                })
+                .collect();
+            let _ = tx.send(results);
+        });
+        self.checks_rx = Some(rx);
+    }
+
+    /// "Chạy từ đây": runs the scenario from a step (up to the breakpoint, if any). Nothing is saved.
+    fn start_run_from(&mut self, ld: PathBuf, inst: Instance, from: Vec<usize>) {
+        self.error = None;
+        let (tx, rx) = channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ai, dir, stop2) = (self.ai.clone(), self.sc.dir(), stop.clone());
+        let popups = self.sc.popups.clone();
+        let mut nodes = self.sc.steps.clone();
+        let breakpoint = self.breakpoint.clone();
+        std::thread::spawn(move || {
+            let r = (|| -> anyhow::Result<()> {
+                let log_tx = tx.clone();
+                let log = move |s: String| {
+                    let _ = log_tx.send(TaskMsg::Event(Event::Log(s)));
+                };
+                compile_nodes(&ai, &mut nodes, &log)?;
+                let (etx, erx) = channel::<Event>();
+                let fwd = tx.clone();
+                std::thread::spawn(move || {
+                    while let Ok(e) = erx.recv() {
+                        let _ = fwd.send(TaskMsg::Event(e));
+                    }
+                });
+                let mut runner = executor::new_runner(&ld, inst, dir.clone(), ai, true, stop2, etx);
+                runner.popups = popups;
+                runner.popup_dir = dir;
+                runner.start_at = Some(from);
+                runner.stop_before = breakpoint;
+                runner.ensure_device()?;
+                runner.run_all(&mut nodes)
+            })();
+            let _ = tx.send(TaskMsg::StepDone(r.map_err(|e| format!("{e:#}"))));
+        });
+        self.task = Some(Task { rx, stop, label: "Đang chạy từ bước đã chọn...", analyse_only: false });
+    }
+
     /// Lists the games installed on the emulator, in the background.
     fn load_packages(&mut self, ld: PathBuf, inst: Instance) {
         let (tx, rx) = channel();
@@ -511,6 +718,19 @@ impl Editor {
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.checks_rx {
+            if let Ok(results) = rx.try_recv() {
+                self.screen.marks = results
+                    .iter()
+                    .filter_map(|c| {
+                        let color = if c.score >= c.threshold { GREEN } else { RED };
+                        c.at.map(|f| (f, color, format!("{} {:.0}%", c.label, c.score * 100.0)))
+                    })
+                    .collect();
+                self.checks = results;
+                self.checks_rx = None;
+            }
+        }
         if let Some(rx) = &self.packages_rx {
             if let Ok(r) = rx.try_recv() {
                 match r {
@@ -673,6 +893,13 @@ pub struct App {
     editor: Option<Editor>,
     confirm_delete: Option<String>,
     message: Option<(String, Color32)>,
+    _desktop: crate::desktop::Desktop,
+    show_settings: bool,
+    show_emulators: bool,
+    /// Whether "Khởi động cùng Windows" is on (read from the registry).
+    autostart: bool,
+    /// Set once the close-to-tray hint has been shown.
+    hinted_tray: bool,
 }
 
 enum RowAction {
@@ -722,6 +949,7 @@ impl App {
             .as_ref()
             .map(|d| d.display().to_string())
             .unwrap_or_default();
+        let hotkey = settings.hotkey;
         let mut app = Self {
             page,
             setup,
@@ -739,8 +967,21 @@ impl App {
             editor: None,
             confirm_delete: None,
             message: None,
+            _desktop: crate::desktop::setup(&cc.egui_ctx, hotkey),
+            show_settings: false,
+            show_emulators: false,
+            autostart: crate::desktop::autostart_enabled(),
+            hinted_tray: false,
         };
+        jobs::gate::set_max_parallel(effective_parallel(&app.settings));
         app.refresh_instances();
+        // Scenarios marked "tự chạy khi mở app" (e.g. after Windows starts).
+        if matches!(app.page, Page::Main) {
+            let ids: Vec<String> = app.scenarios.iter().filter(|s| s.auto_start).map(|s| s.id.clone()).collect();
+            for id in ids {
+                app.apply(RowAction::Start(id));
+            }
+        }
         // `--select <id> [history]`: opens the detail panel of a scenario (for screenshots).
         let args: Vec<String> = std::env::args().collect();
         if let Some(i) = args.iter().position(|a| a == "--select") {
@@ -885,12 +1126,17 @@ impl App {
                             }
                             self.editor = Some(Editor::new(sc, true));
                         }
+                        if ui.button(ic::GEAR).on_hover_text("Cài đặt").clicked() {
+                            self.show_settings = !self.show_settings;
+                        }
+                        if ui.button(format!("{} Giả lập", ic::DEVICE_MOBILE)).on_hover_text("Mở/tắt, sắp xếp cửa sổ giả lập").clicked() {
+                            self.show_emulators = !self.show_emulators;
+                            self.refresh_instances();
+                        }
                         if self.jobs.iter().any(|j| !j.is_finished())
-                            && ui.add(theme::button(format!("{} Dừng tất cả", ic::STOP), RED)).clicked()
+                            && ui.add(theme::button(format!("{} Dừng tất cả", ic::STOP), RED)).on_hover_text(format!("Phím tắt: {}", crate::desktop::HOTKEY_LABEL)).clicked()
                         {
-                            for j in &self.jobs {
-                                j.stop.store(true, Ordering::Relaxed);
-                            }
+                            jobs::stop_all();
                         }
                         if ui
                             .button(format!("{} Nhập", ic::DOWNLOAD_SIMPLE))
@@ -1050,9 +1296,8 @@ impl App {
                         notes.push(format!("Không còn giả lập #{index}."));
                         continue;
                     };
-                    if self.jobs.iter().any(|j| j.instance_index == inst.index) {
-                        notes.push(format!("\"{}\" đang chạy kịch bản khác, bỏ qua.", inst.name));
-                        continue;
+                    if self.jobs.iter().any(|j| j.instance_index == inst.index && j.scenario_id == sc.id) {
+                        continue; // already running there
                     }
                     if let Some(w) = size_warning(&sc, &inst) {
                         notes.push(w);
@@ -1424,6 +1669,8 @@ impl App {
                             ui.add_space(4.0);
                             ui.label(theme::muted("Kiểu chạy"));
                             schedule_ui(ui, ed);
+                            ui.add_space(4.0);
+                            limits_ui(ui, ed);
                         });
                         ui.add_space(12.0);
                         theme::card(ui, |ui| {
@@ -1432,7 +1679,22 @@ impl App {
                             ui.label(theme::muted("Mỗi ô là một bước, viết như nói chuyện. vd: \"bấm xuất chiến góc phải dưới\", \"chọn ải mới nhất\", \"đợi đánh xong\", \"chờ 3 giây\"."));
                             ui.add_space(6.0);
                             let dir = ed.sc.dir();
-                            let mut st = StepsUi { counter: 0, changed: false, picking: ed.picking.as_ref(), pick_request: None, test_request: None, thumbs: &mut ed.thumbs, dir, others: &others };
+                            let var_names: Vec<String> = ed.sc.variables.iter().map(|v| v.name.clone()).filter(|n| !n.trim().is_empty()).collect();
+                            let mut st = StepsUi {
+                                counter: 0,
+                                changed: false,
+                                picking: ed.picking.as_ref(),
+                                pick_request: None,
+                                test_request: None,
+                                thumbs: &mut ed.thumbs,
+                                dir,
+                                others: &others,
+                                var_names: &var_names,
+                                match_request: None,
+                                run_from: None,
+                                breakpoint: ed.breakpoint.as_ref(),
+                                toggle_breakpoint: None,
+                            };
                             nodes_ui(ui, &mut ed.sc.steps, &mut Vec::new(), &mut st);
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
@@ -1445,6 +1707,13 @@ impl App {
                                 }
                             });
                             let (changed, pick_request, test_request) = (st.changed, st.pick_request, st.test_request);
+                            let (match_request, run_from, toggle_bp) = (st.match_request, st.run_from, st.toggle_breakpoint);
+                            if let Some(bp) = toggle_bp {
+                                ed.breakpoint = if ed.breakpoint.as_ref() == Some(&bp) { None } else { Some(bp) };
+                            }
+                            if let Some(rec) = match_request {
+                                ed.test_match(&rec);
+                            }
                             if changed {
                                 ed.trial = None;
                             }
@@ -1459,9 +1728,15 @@ impl App {
                                 }
                             }
                             if let Some(node) = test_request {
-                                match (&ld_dir, inst) {
+                                match (&ld_dir, inst.clone()) {
                                     (Some(ld), Some(inst)) => ed.start_test_step(ld.clone(), inst, node),
                                     _ => ed.error = Some("Chọn giả lập trước khi thử bước".into()),
+                                }
+                            }
+                            if let Some(from) = run_from {
+                                match (&ld_dir, inst) {
+                                    (Some(ld), Some(inst)) => ed.start_run_from(ld.clone(), inst, from),
+                                    _ => ed.error = Some("Chọn giả lập trước khi chạy".into()),
                                 }
                             }
                             let n = script::dynamic_count(&ed.sc.steps);
@@ -1470,6 +1745,8 @@ impl App {
                                 ui.label(RichText::new(format!("{} {n} bước có mục tiêu thay đổi mỗi lần (vd \"ải mới nhất\") nên lần chạy nào AI cũng bật lên cho các bước này.", ic::LIGHTNING)).color(YELLOW).size(13.0));
                             }
                         });
+                        ui.add_space(12.0);
+                        variables_card(ui, ed);
                         ui.add_space(12.0);
                         let pick = safety_card(ui, ed, &instances, &ld_dir);
                         if let Some(t) = pick {
@@ -1527,10 +1804,19 @@ impl App {
                             if ui.add_enabled(can, egui::Button::new(format!("{} Chụp màn hình", ic::CAMERA))).on_hover_text("Lấy màn hình hiện tại của giả lập").clicked() {
                                 ed.capture(ld_dir.clone().unwrap(), inst.cloned().unwrap());
                             }
-                            if ed.shot_rx.is_some() {
+                            if ed.shot_rx.is_some() || ed.checks_rx.is_some() {
                                 ui.spinner();
                             }
+
                         });
+                    });
+                    ui.horizontal(|ui| {
+                        let can_check = ed.screen.img.is_some() && ed.checks_rx.is_none();
+                        let tip = "Tìm từng ảnh nút của kịch bản trên ảnh màn hình hiện tại: biết ngay ảnh nào còn khớp sau khi game cập nhật";
+                        let btn = ui.add_enabled(can_check, egui::Button::new(format!("{} Kiểm tra ảnh mẫu", ic::CHECKS)).small());
+                        if btn.on_hover_text(tip).on_disabled_hover_text("Chụp màn hình giả lập trước").clicked() {
+                            ed.check_templates();
+                        }
                     });
                     ui.add_space(4.0);
                     let picking = ed.picking.clone();
@@ -1550,6 +1836,9 @@ impl App {
                             });
                         });
                         ui.add_space(6.0);
+                    }
+                    if !ed.checks.is_empty() {
+                        checks_ui(ui, ed);
                     }
                     if let Some(picked) = ed.screen.ui(ui, region, picking.as_ref().map(|p| p.kind)) {
                         if let Some(t) = &picking {
@@ -1599,6 +1888,99 @@ impl App {
     }
 }
 
+/// Results of "Kiểm tra ảnh mẫu".
+fn checks_ui(ui: &mut egui::Ui, ed: &mut Editor) {
+    let dir = ed.sc.dir();
+    let ok = ed.checks.iter().filter(|c| c.score >= c.threshold).count();
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("Kiểm tra ảnh mẫu: {ok}/{} khớp trên màn hình này", ed.checks.len())).family(theme::bold()));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button(ic::X).clicked() {
+                ed.checks.clear();
+                ed.screen.marks.clear();
+            }
+        });
+    });
+    ui.label(theme::muted("Ảnh không khớp có thể chỉ là chưa ở đúng màn hình đó. Nếu đang ở đúng màn hình mà vẫn đỏ: khoanh lại ảnh hoặc giảm độ giống."));
+    egui::ScrollArea::vertical().id_salt("checks").max_height(170.0).show(ui, |ui| {
+        for c in &ed.checks {
+            ui.horizontal(|ui| {
+                let good = c.score >= c.threshold;
+                ui.label(RichText::new(if good { ic::CHECK_CIRCLE } else { ic::X_CIRCLE }).color(if good { GREEN } else { RED }));
+                if let Some(tex) = ed.thumbs.get(ui.ctx(), dir.join(&c.template)) {
+                    let [w, h] = tex.size().map(|v| v as f32);
+                    let scale = (24.0 / h).min(90.0 / w).min(1.0);
+                    ui.add(egui::Image::new((tex.id(), vec2(w * scale, h * scale))));
+                }
+                ui.label(&c.label);
+                ui.label(theme::muted(format!("giống {:.0}% (cần {:.0}%)", c.score * 100.0, c.threshold * 100.0)));
+            });
+        }
+    });
+    ui.add_space(6.0);
+}
+
+/// "Biến": numbers kept while a scenario runs (counters, values read on screen).
+fn variables_card(ui: &mut egui::Ui, ed: &mut Editor) {
+    theme::card(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(theme::title(format!("{} Biến", ic::BRACKETS_CURLY)));
+        ui.label(theme::muted("Lưu số để dùng lại: đếm số trận đã đánh, lưu số thể lực đọc được… Dùng ở bước \"Đặt biến\" và điều kiện \"Nếu biến …\"."));
+        let saved = ed.sc.load_vars(ed.sc.instance_index);
+        let mut remove = None;
+        for (i, v) in ed.sc.variables.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut v.name).hint_text("tên biến, vd số trận").desired_width(150.0).margin(Margin::symmetric(8, 4)));
+                egui::ComboBox::from_id_salt(("var-scope", i)).selected_text(v.scope.label()).width(130.0).show_ui(ui, |ui| {
+                    for sc in script::VarScope::ALL {
+                        ui.selectable_value(&mut v.scope, sc, sc.label());
+                    }
+                });
+                if let Some(n) = saved.get(&v.name) {
+                    ui.label(theme::muted(format!("đang = {n}")));
+                }
+                if ui.small_button(ic::TRASH).clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            ed.sc.variables.remove(i);
+        }
+        if ui.button(format!("{} Thêm biến", ic::PLUS)).clicked() {
+            let n = ed.sc.variables.len() + 1;
+            ed.sc.variables.push(script::VarDef { name: format!("biến {n}"), scope: script::VarScope::Run });
+        }
+    });
+}
+
+/// Time window, run limits and emulator options.
+fn limits_ui(ui: &mut egui::Ui, ed: &mut Editor) {
+    let l = &mut ed.sc.limits;
+    if matches!(ed.sc.schedule, Schedule::Repeat { .. }) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(theme::muted("Chỉ chạy từ"));
+            ui.add(egui::TextEdit::singleline(&mut l.from).hint_text("08:00").desired_width(56.0).margin(theme::INPUT_MARGIN));
+            ui.label(theme::muted("đến"));
+            ui.add(egui::TextEdit::singleline(&mut l.to).hint_text("23:00").desired_width(56.0).margin(theme::INPUT_MARGIN));
+            ui.label(theme::muted("(để trống = cả ngày)"));
+        });
+        let bad = |t: &str| !t.trim().is_empty() && chrono::NaiveTime::parse_from_str(t.trim(), "%H:%M").is_err();
+        if bad(&l.from) || bad(&l.to) {
+            ui.colored_label(RED, "Giờ phải dạng HH:MM, vd 08:00");
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label(theme::muted("Dừng sau"));
+            ui.add(egui::DragValue::new(&mut l.max_minutes).range(0..=10000));
+            ui.label(theme::muted("phút hoặc"));
+            ui.add(egui::DragValue::new(&mut l.max_runs).range(0..=100000));
+            ui.label(theme::muted("lượt (0 = không giới hạn)"));
+        });
+    }
+    ui.checkbox(&mut ed.sc.close_emulator_after, "Tắt giả lập khi xong (sau mỗi lượt theo giờ, hoặc khi chạy đủ)");
+    ui.checkbox(&mut ed.sc.auto_start, "Tự chạy khi mở app (dùng cùng \"Khởi động cùng Windows\" trong Cài đặt)");
+}
+
 /// "Popup & tự phục hồi": rules checked before every step, and how to recover from errors.
 /// Returns a pick request (popup picture/point, start screen).
 fn safety_card(ui: &mut egui::Ui, ed: &mut Editor, instances: &[Instance], ld_dir: &Option<PathBuf>) -> Option<PickTarget> {
@@ -1609,6 +1991,7 @@ fn safety_card(ui: &mut egui::Ui, ed: &mut Editor, instances: &[Instance], ld_di
     let request = |slot: Slot, kind: PickKind| Some(PickTarget { path: Vec::new(), slot, kind });
     let mut changed = false;
     let mut load_games: Option<Instance> = None;
+    let mut test_match: Option<script::Rec> = None;
     theme::card(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.label(theme::title(format!("{} Popup & tự phục hồi", ic::SHIELD_CHECK)));
@@ -1629,6 +2012,16 @@ fn safety_card(ui: &mut egui::Ui, ed: &mut Editor, instances: &[Instance], ld_di
                 }
                 if pick_button(ui, is_picking(Slot::PopupImage(i)), rule.rec.template.is_empty(), "ảnh popup") {
                     pick = request(Slot::PopupImage(i), PickKind::Image);
+                }
+                if !rule.rec.template.is_empty() {
+                    let mut pct = (rule.rec.threshold() * 100.0).round();
+                    if ui.add(egui::DragValue::new(&mut pct).range(50.0..=99.0).suffix("%")).on_hover_text("Độ giống cần có").changed() {
+                        rule.rec.threshold = Some(pct / 100.0);
+                        changed = true;
+                    }
+                    if ui.add(egui::Button::new(RichText::new(ic::CROSSHAIR).size(13.0)).small()).on_hover_text("Thử khớp trên ảnh màn hình").clicked() {
+                        test_match = Some(rule.rec.clone());
+                    }
                 }
                 ui.label(theme::muted("thì"));
                 let current = match rule.action {
@@ -1723,6 +2116,9 @@ fn safety_card(ui: &mut egui::Ui, ed: &mut Editor, instances: &[Instance], ld_di
     });
     if let (Some(inst), Some(ld)) = (load_games, ld_dir) {
         ed.load_packages(ld.clone(), inst);
+    }
+    if let Some(rec) = test_match {
+        ed.test_match(&rec);
     }
     if changed {
         ed.trial = None;
@@ -1846,6 +2242,15 @@ struct StepsUi<'a> {
     dir: PathBuf,
     /// Other scenarios (id, name), for "Chạy kịch bản con".
     others: &'a [(String, String)],
+    /// Variable names of the scenario.
+    var_names: &'a [String],
+    /// "Thử khớp": the picture to look for on the current screenshot.
+    match_request: Option<script::Rec>,
+    /// "Chạy từ đây".
+    run_from: Option<Vec<usize>>,
+    /// "Dừng trước bước này" (shown on that step; clicking toggles it).
+    breakpoint: Option<&'a Vec<usize>>,
+    toggle_breakpoint: Option<Vec<usize>>,
 }
 
 impl StepsUi<'_> {
@@ -1930,7 +2335,7 @@ fn interpretation(ui: &mut egui::Ui, node: &Node, indent: f32) {
 }
 
 fn empty_rec() -> script::Rec {
-    script::Rec { template: String::new(), x: 0, y: 0 }
+    script::Rec::default()
 }
 
 /// What has to be picked on the screen right after adding a step.
@@ -1968,6 +2373,12 @@ fn new_step_kinds() -> Vec<Option<(String, &'static str, fn() -> NewStep)>> {
         })),
         Some((format!("{} Nếu số trong vùng … thì …", ic::HASH), "Đọc số trong một vùng (vd thể lực 97/120 đọc ra 97) rồi so sánh", || {
             (Node::new_if(Cond::new_number()), Some((Slot::Cond, PickKind::Region)))
+        })),
+        Some((format!("{} Nếu biến … thì …", ic::BRACKETS_CURLY), "Rẽ nhánh theo giá trị một biến (vd số trận đã đánh hôm nay)", || {
+            (Node::new_if(Cond::new_var()), None)
+        })),
+        Some((format!("{} Đặt biến (gán, cộng, đọc số)", ic::CALCULATOR), "vd cộng 1 vào \"số trận\" sau mỗi trận, hoặc lưu số thể lực đọc được", || {
+            (Node::manual(Step::SetVar { name: String::new(), change: script::VarOp::Add { value: 1.0 } }), None)
         })),
         Some((format!("{} Dừng kịch bản", ic::STOP_CIRCLE), "Kết thúc lượt chạy này (vd khi hết thể lực)", || (Node::manual(Step::StopRun), None))),
         Some((format!("{} Chạy kịch bản con", ic::FLOW_ARROW), "Chạy các bước của một kịch bản khác ở đây (vd \"về màn hình chính\")", || {
@@ -2011,6 +2422,7 @@ fn step_icon(step: &Step) -> &'static str {
         Step::Wait { .. } => ic::TIMER,
         Step::Back => ic::ARROW_U_UP_LEFT,
         Step::StopRun => ic::STOP_CIRCLE,
+        Step::SetVar { .. } => ic::CALCULATOR,
         Step::Call { .. } => ic::FLOW_ARROW,
         _ => ic::PENCIL_SIMPLE,
     }
@@ -2034,6 +2446,38 @@ fn pick_button(ui: &mut egui::Ui, picking: bool, unset: bool, what: &str) -> boo
     ui.add(egui::Button::new(RichText::new(format!("{} {label}", ic::CURSOR_CLICK)).size(13.0)).small().selected(picking)).clicked()
 }
 
+/// "Độ giống ≥ N%" slider and "Thử khớp" button for a saved picture.
+fn threshold_ui(ui: &mut egui::Ui, rec: &mut script::Rec, st: &mut StepsUi) {
+    if rec.template.is_empty() {
+        return;
+    }
+    let mut pct = (rec.threshold() * 100.0).round();
+    ui.label(RichText::new("độ giống ≥").size(13.0).color(MUTED));
+    if ui.add(egui::DragValue::new(&mut pct).range(50.0..=99.0).suffix("%")).on_hover_text("Thấp hơn: dễ khớp hơn (nút có hiệu ứng). Cao hơn: chặt hơn (tránh khớp nhầm nút giống nhau). Mặc định 88%").changed() {
+        rec.threshold = Some(pct / 100.0);
+        st.changed = true;
+    }
+    if ui.add(egui::Button::new(RichText::new(format!("{} Thử khớp", ic::CROSSHAIR)).size(13.0)).small()).on_hover_text("Tìm ảnh này trên ảnh màn hình hiện tại").clicked() {
+        st.match_request = Some(rec.clone());
+    }
+}
+
+/// Picks a variable by name.
+fn var_combo(ui: &mut egui::Ui, id: impl std::hash::Hash, name: &mut String, st: &mut StepsUi) {
+    let shown = if name.is_empty() { "(chọn biến)".to_string() } else { name.clone() };
+    egui::ComboBox::from_id_salt(id).selected_text(shown).width(130.0).show_ui(ui, |ui| {
+        if st.var_names.is_empty() {
+            ui.label(theme::muted("Thêm biến ở thẻ \"Biến\" bên dưới"));
+        }
+        for v in st.var_names {
+            if ui.selectable_label(name == v, v).clicked() {
+                *name = v.clone();
+                st.changed = true;
+            }
+        }
+    });
+}
+
 /// Editor for a condition ("thấy ảnh" / "số trong vùng …").
 fn cond_ui(ui: &mut egui::Ui, cond: &mut Cond, st: &mut StepsUi, path: &[usize]) {
     ui.horizontal_wrapped(|ui| match cond {
@@ -2047,6 +2491,7 @@ fn cond_ui(ui: &mut egui::Ui, cond: &mut Cond, st: &mut StepsUi, path: &[usize])
             if pick_button(ui, picking, rec.template.is_empty(), "ảnh") {
                 st.request(path, Slot::Cond, PickKind::Image);
             }
+            threshold_ui(ui, rec, st);
             let picking = st.is_picking(path, Slot::Cond, PickKind::Region);
             let label = if region.is_some() { format!("{} Vùng tìm ✓", ic::SELECTION) } else { format!("{} Vùng tìm", ic::SELECTION) };
             if ui.add(egui::Button::new(RichText::new(label).size(13.0)).small().selected(picking || region.is_some())).clicked() {
@@ -2065,6 +2510,20 @@ fn cond_ui(ui: &mut egui::Ui, cond: &mut Cond, st: &mut StepsUi, path: &[usize])
                 st.request(path, Slot::Cond, PickKind::Region);
             }
             egui::ComboBox::from_id_salt(("cmp", path.to_vec())).selected_text(op.symbol()).width(46.0).show_ui(ui, |ui| {
+                for c in script::Cmp::ALL {
+                    if ui.selectable_value(op, c, c.symbol()).changed() {
+                        st.changed = true;
+                    }
+                }
+            });
+            if ui.add(egui::DragValue::new(value).speed(1.0)).changed() {
+                st.changed = true;
+            }
+        }
+        Cond::Var { name, op, value } => {
+            ui.label(RichText::new("biến").color(TEXT));
+            var_combo(ui, ("cond-var", path.to_vec()), name, st);
+            egui::ComboBox::from_id_salt(("cmp-var", path.to_vec())).selected_text(op.symbol()).width(46.0).show_ui(ui, |ui| {
                 for c in script::Cmp::ALL {
                     if ui.selectable_value(op, c, c.symbol()).changed() {
                         st.changed = true;
@@ -2101,8 +2560,44 @@ fn manual_body(ui: &mut egui::Ui, node: &mut Node, st: &mut StepsUi, path: &[usi
                 st.request(path, slot, kind);
             }
         }
+        if let Step::TapImage { rec, .. } | Step::WaitImage { rec, .. } = step {
+            threshold_ui(ui, rec, st);
+        }
         let muted = |t: &str| RichText::new(t).size(13.0).color(MUTED);
         let changed = match step {
+            Step::SetVar { name, change } => {
+                var_combo(ui, ("setvar", path.to_vec(), otherwise), name, st);
+                let kind = match change {
+                    script::VarOp::Set { .. } => "=",
+                    script::VarOp::Add { .. } => "cộng thêm",
+                    script::VarOp::Read { .. } => "= số đọc trong vùng",
+                };
+                let mut c = false;
+                egui::ComboBox::from_id_salt(("varop", path.to_vec(), otherwise)).selected_text(kind).width(150.0).show_ui(ui, |ui| {
+                    if ui.selectable_label(matches!(change, script::VarOp::Set { .. }), "=").clicked() {
+                        *change = script::VarOp::Set { value: 0.0 };
+                        c = true;
+                    }
+                    if ui.selectable_label(matches!(change, script::VarOp::Add { .. }), "cộng thêm (số âm để trừ)").clicked() {
+                        *change = script::VarOp::Add { value: 1.0 };
+                        c = true;
+                    }
+                    if ui.selectable_label(matches!(change, script::VarOp::Read { .. }), "= số đọc trong vùng").clicked() {
+                        *change = script::VarOp::Read { region: [0.0; 4] };
+                        st.request(path, Slot::VarRegion, PickKind::Region);
+                        c = true;
+                    }
+                });
+                match change {
+                    script::VarOp::Set { value } | script::VarOp::Add { value } => c |= ui.add(egui::DragValue::new(value).speed(1.0)).changed(),
+                    script::VarOp::Read { region } => {
+                        if pick_button(ui, st.is_picking(path, Slot::VarRegion, PickKind::Region), region[2] <= region[0], "vùng") {
+                            st.request(path, Slot::VarRegion, PickKind::Region);
+                        }
+                    }
+                }
+                c
+            }
             Step::Wait { seconds } => {
                 ui.label(muted("chờ"));
                 let c = ui.add(egui::DragValue::new(seconds).range(0.5..=3600.0).speed(0.5)).changed();
@@ -2200,6 +2695,11 @@ fn block_ui(ui: &mut egui::Ui, node: &mut Node, path: &mut Vec<usize>, st: &mut 
                                 st.changed = true;
                                 ui.close();
                             }
+                            if ui.button(format!("{} biến …", ic::BRACKETS_CURLY)).clicked() {
+                                *until = Some(Cond::new_var());
+                                st.changed = true;
+                                ui.close();
+                            }
                         });
                     }
                 }
@@ -2269,7 +2769,8 @@ fn nodes_ui(ui: &mut egui::Ui, nodes: &mut Vec<Node>, path: &mut Vec<usize>, st:
         ui.horizontal_top(|ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(26.0, 38.0), egui::Sense::hover());
             let done = node.step.as_ref().is_some_and(|s| !s.needs_pick());
-            ui.painter().circle_filled(rect.center(), 12.0, if done { ACCENT.gamma_multiply(0.35) } else { BORDER });
+            let fill = if st.breakpoint == Some(&*path) { RED } else if done { ACCENT.gamma_multiply(0.35) } else { BORDER };
+            ui.painter().circle_filled(rect.center(), 12.0, fill);
             ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, number.to_string(), egui::FontId::new(13.0, theme::bold()), TEXT);
             // Buttons first (right to left) so the content takes exactly what is left.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
@@ -2300,6 +2801,14 @@ fn nodes_ui(ui: &mut egui::Ui, nodes: &mut Vec<Node>, path: &mut Vec<usize>, st:
             let small = |t: String| egui::Button::new(RichText::new(t).size(13.0)).small();
             if testable && ui.add(small(format!("{} Thử bước này", ic::PLAY))).on_hover_text("Chạy riêng bước này trên giả lập ngay bây giờ").clicked() {
                 st.test_request = Some(node.clone());
+            }
+            if ui.add(small(format!("{} Chạy từ đây", ic::SKIP_FORWARD))).on_hover_text("Chạy kịch bản bắt đầu từ bước này (bỏ qua các bước trước)").clicked() {
+                st.run_from = Some(path.clone());
+            }
+            let is_bp = st.breakpoint == Some(&*path);
+            let bp = small(format!("{} Dừng trước bước này", ic::PAUSE_CIRCLE)).selected(is_bp);
+            if ui.add(bp).on_hover_text("Chạy thử sẽ dừng lại ngay trước bước này (bấm lần nữa để bỏ)").clicked() {
+                st.toggle_breakpoint = Some(path.clone());
             }
             if searches {
                 let picking_this = st.is_picking(path, Slot::Step, PickKind::Region);
@@ -2555,12 +3064,118 @@ fn log_ui(ui: &mut egui::Ui, log: &[String]) {
         });
 }
 
+impl App {
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_settings;
+        let mut changed = false;
+        egui::Window::new(format!("{} Cài đặt", ic::GEAR)).open(&mut open).collapsible(false).resizable(false).default_width(460.0).show(ctx, |ui| {
+            let mut auto = self.autostart;
+            if ui.checkbox(&mut auto, "Khởi động cùng Windows (mở ẩn dưới khay hệ thống)").changed() {
+                match crate::desktop::set_autostart(auto) {
+                    Ok(()) => self.autostart = auto,
+                    Err(e) => self.message = Some((format!("Không đổi được: {e:#}"), YELLOW)),
+                }
+            }
+            ui.label(theme::muted("Kịch bản nào bật \"Tự chạy khi mở app\" sẽ tự bắt đầu khi máy khởi động."));
+            ui.add_space(6.0);
+            changed |= ui.checkbox(&mut self.settings.close_to_tray, "Bấm ✕ thì ẩn xuống khay hệ thống (kịch bản vẫn chạy)").changed();
+            changed |= ui.checkbox(&mut self.settings.hotkey, format!("Phím {} dừng tất cả, bấm ở đâu cũng được", crate::desktop::HOTKEY_LABEL)).changed();
+            ui.label(theme::muted("Đổi phím tắt có tác dụng sau khi mở lại app."));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Tối đa giả lập chạy cùng lúc");
+                changed |= ui.add(egui::DragValue::new(&mut self.settings.max_parallel).range(0..=32)).changed();
+            });
+            ui.label(theme::muted(format!(
+                "0 = tự động: máy có {}GB RAM nên chạy tối đa {} giả lập (khoảng 4GB mỗi cái). Giả lập vượt quá sẽ chờ đến lượt.",
+                device::total_ram_gb(),
+                ((device::total_ram_gb() / 4) as usize).max(1)
+            )));
+            ui.add_space(6.0);
+            ui.label(theme::muted("Máy sẽ không tự ngủ khi đang có kịch bản chạy."));
+        });
+        self.show_settings = open;
+        if changed {
+            self.settings.save();
+            jobs::gate::set_max_parallel(effective_parallel(&self.settings));
+        }
+    }
+
+    fn emulators_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_emulators;
+        let mut refresh = false;
+        egui::Window::new(format!("{} Giả lập", ic::DEVICE_MOBILE)).open(&mut open).collapsible(false).default_width(520.0).show(ctx, |ui| {
+            let Some(ld) = self.settings.ld_dir.clone() else {
+                ui.label("Chưa tìm thấy LDPlayer.");
+                return;
+            };
+            egui::Grid::new("emulators").num_columns(4).spacing([14.0, 8.0]).striped(true).show(ui, |ui| {
+                for inst in &self.instances {
+                    let (dot, color) = if inst.running { ("●", GREEN) } else { ("○", MUTED) };
+                    ui.label(RichText::new(dot).color(color));
+                    ui.label(&inst.name);
+                    ui.label(theme::muted(format!("{}x{}", inst.size[0], inst.size[1])));
+                    let busy = self.jobs.iter().any(|j| j.instance_index == inst.index && !j.is_finished());
+                    if inst.running {
+                        let btn = ui.add_enabled(!busy, egui::Button::new(format!("{} Tắt", ic::POWER)));
+                        if btn.on_disabled_hover_text("Đang có kịch bản chạy trên giả lập này").clicked() {
+                            let _ = device::quit_instance(&ld, inst.index);
+                            refresh = true;
+                        }
+                    } else if ui.button(format!("{} Mở", ic::PLAY)).clicked() {
+                        let _ = device::launch_instance(&ld, inst.index);
+                        refresh = true;
+                    }
+                    ui.end_row();
+                }
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button(format!("{} Sắp xếp cửa sổ", ic::SQUARES_FOUR)).on_hover_text("Xếp các cửa sổ giả lập đang mở cạnh nhau").clicked() {
+                    let _ = device::sort_windows(&ld);
+                }
+                if ui.button(format!("{} Làm mới", ic::ARROWS_CLOCKWISE)).clicked() {
+                    refresh = true;
+                }
+            });
+            ui.label(theme::muted(format!(
+                "Chạy cùng lúc tối đa {} giả lập (đổi trong Cài đặt). Mỗi kịch bản có thể tự tắt giả lập khi xong.",
+                effective_parallel(&self.settings)
+            )));
+        });
+        self.show_emulators = open;
+        if refresh {
+            // ldconsole needs a moment before the new state shows up.
+            std::thread::sleep(Duration::from_millis(600));
+            self.refresh_instances();
+        }
+    }
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Closing the window keeps the app (and the runs) going in the tray.
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.settings.close_to_tray
+            && !crate::desktop::QUITTING.load(Ordering::Relaxed)
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            crate::desktop::hide_window(ctx);
+            if !self.hinted_tray {
+                self.hinted_tray = true;
+                self.info("OmniPilot vẫn chạy dưới khay hệ thống. Chuột phải vào icon để mở lại hoặc thoát hẳn.");
+            }
+        }
         match self.page {
             Page::Setup => self.setup_ui(ctx),
             Page::Main if self.editor.is_some() => self.editor_ui(ctx),
             Page::Main => self.main_ui(ctx),
+        }
+        if self.show_settings {
+            self.settings_window(ctx);
+        }
+        if self.show_emulators {
+            self.emulators_window(ctx);
         }
         // Workers report through channels; keep polling while anything is active.
         ctx.request_repaint_after(Duration::from_millis(250));

@@ -108,7 +108,12 @@ pub fn find(png_path: &str, text: &str, region: Option<&str>) -> Result<()> {
 }
 
 /// `--run <giả lập> <thư mục kịch bản>`: replays a saved scenario like a scheduled run.
-pub fn run_saved(index: u32, dir: &str) -> Result<()> {
+/// "1.0.2" → [1, 0, 2] (0-based step path, see `node_at` in the UI).
+fn parse_path(s: &str) -> Vec<usize> {
+    s.split('.').filter_map(|p| p.parse().ok()).collect()
+}
+
+pub fn run_saved(index: u32, dir: &str, extra: &[String]) -> Result<()> {
     let ld = device::find_ldplayer().context("không tìm thấy LDPlayer")?;
     let inst = device::list_instances(&ld)?.into_iter().find(|i| i.index == index).context("không có instance này")?;
     let json = std::fs::read_to_string(std::path::Path::new(dir).join("scenario.json"))?;
@@ -128,6 +133,14 @@ pub fn run_saved(index: u32, dir: &str) -> Result<()> {
     let mut runner = executor::new_runner(&ld, inst, dir.into(), ai.clone(), false, Arc::new(AtomicBool::new(false)), tx);
     runner.popups = sc.popups.clone();
     runner.popup_dir = dir.into();
+    runner.vars = sc.load_vars(index);
+    for a in extra {
+        if let Some(p) = a.strip_prefix("from=") {
+            runner.start_at = Some(parse_path(p));
+        } else if let Some(p) = a.strip_prefix("stop=") {
+            runner.stop_before = Some(parse_path(p));
+        }
+    }
     runner.ensure_device()?;
     let mut result = runner.ensure_app(&sc.recovery, dir.as_ref()).and_then(|_| runner.run_all(&mut sc.steps));
     if let Err(e) = &result {
@@ -142,6 +155,8 @@ pub fn run_saved(index: u32, dir: &str) -> Result<()> {
         result = Err(anyhow::anyhow!("{e:#}"));
     }
     let shot = runner.last_screen.clone();
+    sc.save_vars(index, &runner.vars);
+    println!("Biến: {:?}", runner.vars);
     drop(runner);
     // Same history as a scheduled run (only for scenarios in the app's folder).
     if std::path::Path::new(dir).starts_with(crate::paths::scenarios_dir()) {
@@ -154,27 +169,33 @@ pub fn run_saved(index: u32, dir: &str) -> Result<()> {
 
 /// `--job <giả lập> <thư mục kịch bản>`: runs a saved scenario exactly like the Start
 /// button (schedule, recovery and retries, history) and prints its status lines.
-pub fn job(index: u32, dir: &str) -> Result<()> {
+pub fn job(index: u32, dirs: &[String]) -> Result<()> {
     let ld = device::find_ldplayer().context("không tìm thấy LDPlayer")?;
     let inst = device::list_instances(&ld)?.into_iter().find(|i| i.index == index).context("không có instance này")?;
-    let json = std::fs::read_to_string(std::path::Path::new(dir).join("scenario.json"))?;
-    let sc: Scenario = serde_json::from_str(json.trim_start_matches('\u{feff}'))?;
-    let mut job = crate::jobs::start(sc, ld, inst);
-    let mut shown = 0;
-    while !job.is_finished() || shown < job.log.len() {
-        job.poll();
-        for line in &job.log[shown..] {
-            println!("{line}");
+    // Several scenarios at once on the same emulator: they take turns.
+    let mut jobs = Vec::new();
+    for dir in dirs {
+        let json = std::fs::read_to_string(std::path::Path::new(dir).join("scenario.json"))?;
+        let sc: Scenario = serde_json::from_str(json.trim_start_matches('\u{feff}'))?;
+        let name = sc.name.clone();
+        jobs.push((name, crate::jobs::start(sc, ld.clone(), inst.clone()), 0usize));
+    }
+    let print_new = |jobs: &mut Vec<(String, crate::jobs::Job, usize)>| {
+        for (name, job, shown) in jobs.iter_mut() {
+            job.poll();
+            for line in &job.log[*shown..] {
+                println!("[{name}] {line}");
+            }
+            *shown = job.log.len();
         }
-        shown = job.log.len();
+    };
+    while jobs.iter().any(|(_, j, _)| !j.is_finished()) {
+        print_new(&mut jobs);
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
-    // The worker's last status may arrive just after it finished.
+    // The workers' last status may arrive just after they finished.
     std::thread::sleep(std::time::Duration::from_millis(300));
-    job.poll();
-    for line in &job.log[shown..] {
-        println!("{line}");
-    }
+    print_new(&mut jobs);
     Ok(())
 }
 
