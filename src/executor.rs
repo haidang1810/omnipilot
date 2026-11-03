@@ -236,8 +236,8 @@ impl Runner {
     pub fn run(&mut self, nodes: &mut [Node]) -> Result<()> {
         for node in nodes.iter_mut() {
             self.check_stop()?;
-            if !node.text.is_empty() {
-                self.log(format!("▸ {}", node.text));
+            if !node.is_loop() {
+                self.log(format!("▸ {}", label(node)));
             }
             self.run_node(node)?;
         }
@@ -260,14 +260,15 @@ impl Runner {
                     if used >= node.otherwise_max {
                         self.log(format!(
                             "Đã làm \"{}\" {used} lần mà vẫn không thấy",
-                            other.text
+                            label(other)
                         ));
                         return Err(e);
                     }
                     used += 1;
                     self.log(format!(
                         "Không thấy, làm \"{}\" ({used}/{})",
-                        other.text, node.otherwise_max
+                        label(other),
+                        node.otherwise_max
                     ));
                     let Some(other_step) = other.step.as_mut() else {
                         bail!("bước \"{}\" chưa được AI phân tích", other.text)
@@ -391,8 +392,87 @@ impl Runner {
                 }
                 Ok(())
             }
+            s if s.needs_pick() => bail!("có bước chưa chọn vị trí trên màn hình"),
+            Step::TapPoint { x, y } => {
+                let frame = self.shot()?;
+                let (px, py) = to_pixels(&frame, [*x, *y]);
+                self.tap_at(&frame, Rect { x: px, y: py, w: 1, h: 1 }, "điểm đã chọn")
+            }
+            Step::TapImage { all, max, rec } => {
+                let mut count = 0;
+                while count < if *all { *max } else { 1 } {
+                    // The first look waits for the screen to load; later ones only check.
+                    let tries = if count == 0 { 5 } else { 2 };
+                    match self.find_image(rec, region, tries)? {
+                        Some((frame, r)) => {
+                            self.tap_at(&frame, r, "nút giống ảnh")?;
+                            count += 1;
+                        }
+                        None if count == 0 && !*all => return Err(NotFound("nút giống ảnh".into()).into()),
+                        None => break,
+                    }
+                }
+                if *all {
+                    self.log(format!("Đã bấm {count} nút giống ảnh"));
+                }
+                Ok(())
+            }
+            Step::WaitImage { timeout_sec, rec } => {
+                self.log("Đợi đến khi thấy ảnh...");
+                match self.find_image(rec, region, (*timeout_sec).max(1))? {
+                    Some(_) => {
+                        self.log("Đã thấy ảnh");
+                        Ok(())
+                    }
+                    None => Err(anyhow!("hết {timeout_sec}s mà chưa thấy ảnh")),
+                }
+            }
+            Step::Swipe { from, to, ms } => {
+                let frame = self.shot()?;
+                let (a, b) = (to_pixels(&frame, *from), to_pixels(&frame, *to));
+                self.log(format!("Vuốt từ {a:?} đến {b:?}"));
+                self.device.swipe(a, b, *ms)?;
+                self.wait_for_change(&frame)
+            }
         }
     }
+
+    /// Looks for a hand-picked button picture, once a second, `tries` times.
+    /// With a search area, matches outside it are ignored.
+    fn find_image(&mut self, rec: &Rec, region: Option<[f32; 4]>, tries: u32) -> Result<Option<(Frame, Rect)>> {
+        for attempt in 0..tries {
+            self.check_stop()?;
+            if attempt > 0 {
+                self.sleep(Duration::from_secs(1))?;
+            }
+            let frame = self.shot()?;
+            if let Some(r) = self.match_template(&frame, rec) {
+                let (cx, cy) = r.center();
+                let inside = region.is_none_or(|g| {
+                    let (fx, fy) = (cx as f32 / frame.img.width() as f32, cy as f32 / frame.img.height() as f32);
+                    fx >= g[0] && fx <= g[2] && fy >= g[1] && fy <= g[3]
+                });
+                if inside {
+                    return Ok(Some((frame, r)));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// What to call a step in the log: the user's words, or how a hand-made step works.
+fn label(node: &Node) -> String {
+    match (&node.step, node.text.trim()) {
+        (Some(s), "") => s.describe(),
+        (_, t) => t.to_string(),
+    }
+}
+
+/// Fractions of the screen → pixels of this frame.
+fn to_pixels(frame: &Frame, f: [f32; 2]) -> (u32, u32) {
+    let (w, h) = (frame.img.width(), frame.img.height());
+    (((f[0].clamp(0.0, 1.0) * w as f32) as u32).min(w - 1), ((f[1].clamp(0.0, 1.0) * h as f32) as u32).min(h - 1))
 }
 
 pub fn new_runner(

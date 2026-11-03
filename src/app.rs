@@ -38,110 +38,112 @@ impl Settings {
     }
 }
 
-/// Shows the latest screenshot with a marker where the last tap happened.
+/// What the user is choosing on the screenshot.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PickKind {
+    /// Search area for a step (drag a box).
+    Region,
+    /// A point to tap (click).
+    Point,
+    /// A button picture (drag a box around it).
+    Image,
+    /// A swipe (drag from start to end).
+    Swipe,
+}
+
+impl PickKind {
+    fn instruction(self) -> &'static str {
+        match self {
+            PickKind::Region => "Kéo chuột khoanh vùng AI được tìm cho bước này",
+            PickKind::Point => "Bấm vào điểm trên ảnh mà app sẽ bấm",
+            PickKind::Image => "Kéo chuột khoanh quanh nút (app nhớ hình nút này và tìm nó mỗi lần chạy)",
+            PickKind::Swipe => "Kéo chuột từ điểm bắt đầu đến điểm kết thúc của thao tác vuốt",
+        }
+    }
+}
+
+/// A finished pick, in fractions of the screen size.
+enum Picked {
+    Rect([f32; 4]),
+    Point([f32; 2]),
+    Line([f32; 2], [f32; 2]),
+}
+
+/// Shows the latest screenshot with a marker where the last tap happened,
+/// and lets the user pick points, boxes and swipes on it.
 #[derive(Default)]
 struct ScreenView {
     tex: Option<TextureHandle>,
+    /// The screenshot itself, to cut button pictures from.
+    img: Option<RgbaImage>,
     size: [u32; 2],
     tap: Option<(u32, u32)>,
     shown_gen: u64,
-    /// Start and current pointer position while the user drags out a search area.
+    /// Start and current pointer position while dragging.
     drag: Option<(egui::Pos2, egui::Pos2)>,
 }
 
 impl ScreenView {
     fn set(&mut self, ctx: &egui::Context, img: &RgbaImage, tap: Option<(u32, u32)>) {
-        let color = egui::ColorImage::from_rgba_unmultiplied(
-            [img.width() as usize, img.height() as usize],
-            img.as_raw(),
-        );
+        let color = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
         match &mut self.tex {
             Some(t) => t.set(color, egui::TextureOptions::LINEAR),
-            None => {
-                self.tex = Some(ctx.load_texture("screen", color, egui::TextureOptions::LINEAR))
-            }
+            None => self.tex = Some(ctx.load_texture("screen", color, egui::TextureOptions::LINEAR)),
         }
+        self.img = Some(img.clone());
         self.size = [img.width(), img.height()];
         self.tap = tap;
     }
 
-    /// Draws the screen with the last tap and `region` (fractions of the screen) on top.
-    /// With `picking`, the user drags out a new area, which is returned when released.
-    fn ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        region: Option<[f32; 4]>,
-        picking: bool,
-    ) -> Option<[f32; 4]> {
+    /// Draws the screen with the last tap and `region` on top. With `pick`, the user
+    /// clicks or drags on it; the result is returned when done.
+    fn ui(&mut self, ui: &mut egui::Ui, region: Option<[f32; 4]>, pick: Option<PickKind>) -> Option<Picked> {
         let w = ui.available_width();
         let Some(tex) = &self.tex else {
             let (rect, _) = ui.allocate_exact_size(vec2(w, w * 9.0 / 16.0), egui::Sense::hover());
             ui.painter().rect_filled(rect, 10, theme::INPUT);
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                format!("{}  Chưa có ảnh màn hình", ic::DEVICE_MOBILE_SPEAKER),
-                egui::FontId::proportional(15.0),
-                MUTED,
-            );
+            let text = if pick.is_some() { "Đang chụp màn hình giả lập…" } else { "Chưa có ảnh màn hình" };
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, format!("{}  {text}", ic::DEVICE_MOBILE_SPEAKER), egui::FontId::proportional(15.0), MUTED);
             return None;
         };
         let size = vec2(w, w * self.size[1] as f32 / self.size[0] as f32);
-        let sense = if picking {
-            egui::Sense::drag()
-        } else {
-            egui::Sense::hover()
-        };
-        let resp = ui.add(
-            egui::Image::new((tex.id(), size))
-                .corner_radius(10)
-                .sense(sense),
-        );
+        let sense = if pick.is_some() { egui::Sense::click_and_drag() } else { egui::Sense::hover() };
+        let resp = ui.add(egui::Image::new((tex.id(), size)).corner_radius(10).sense(sense));
         let rect = resp.rect;
-        let to_screen = |f: [f32; 4]| {
-            egui::Rect::from_two_pos(
-                rect.lerp_inside(vec2(f[0], f[1])),
-                rect.lerp_inside(vec2(f[2], f[3])),
-            )
-        };
+        let to_screen = |f: [f32; 4]| egui::Rect::from_two_pos(rect.lerp_inside(vec2(f[0], f[1])), rect.lerp_inside(vec2(f[2], f[3])));
         let to_frac = |p: egui::Pos2| {
             let v = (p - rect.min) / rect.size();
             [v.x.clamp(0.0, 1.0), v.y.clamp(0.0, 1.0)]
         };
+        let painter = ui.painter().clone();
 
         if let Some(r) = region {
             let r = to_screen(r);
-            ui.painter().rect_filled(r, 4, ACCENT.gamma_multiply(0.12));
-            ui.painter().rect_stroke(
-                r,
-                4,
-                egui::Stroke::new(2.0_f32, ACCENT),
-                egui::StrokeKind::Inside,
-            );
-            ui.painter().text(
-                r.left_top() + vec2(6.0, 4.0),
-                egui::Align2::LEFT_TOP,
-                "Vùng tìm",
-                egui::FontId::new(13.0, theme::bold()),
-                ACCENT,
-            );
+            painter.rect_filled(r, 4, ACCENT.gamma_multiply(0.12));
+            painter.rect_stroke(r, 4, egui::Stroke::new(2.0_f32, ACCENT), egui::StrokeKind::Inside);
+            painter.text(r.left_top() + vec2(6.0, 4.0), egui::Align2::LEFT_TOP, "Vùng tìm", egui::FontId::new(13.0, theme::bold()), ACCENT);
         }
         if let Some((x, y)) = self.tap {
-            let p = rect.min
-                + vec2(
-                    x as f32 / self.size[0] as f32 * size.x,
-                    y as f32 / self.size[1] as f32 * size.y,
-                );
-            ui.painter()
-                .circle_stroke(p, 13.0, egui::Stroke::new(3.0_f32, RED));
-            ui.painter().circle_filled(p, 3.5, RED);
+            let p = rect.min + vec2(x as f32 / self.size[0] as f32 * size.x, y as f32 / self.size[1] as f32 * size.y);
+            painter.circle_stroke(p, 13.0, egui::Stroke::new(3.0_f32, RED));
+            painter.circle_filled(p, 3.5, RED);
         }
-        if !picking {
+        let Some(kind) = pick else {
             self.drag = None;
+            return None;
+        };
+
+        let resp = resp.on_hover_cursor(egui::CursorIcon::Crosshair);
+        if kind == PickKind::Point {
+            if let Some(p) = resp.hover_pos() {
+                painter.circle_stroke(p, 12.0, egui::Stroke::new(2.0_f32, YELLOW));
+            }
+            if resp.clicked() {
+                return resp.interact_pointer_pos().map(|p| Picked::Point(to_frac(p)));
+            }
             return None;
         }
 
-        let resp = resp.on_hover_cursor(egui::CursorIcon::Crosshair);
         if resp.drag_started() {
             if let Some(p) = resp.interact_pointer_pos() {
                 self.drag = Some((p, p));
@@ -151,31 +153,50 @@ impl ScreenView {
             self.drag = Some((start, p));
         }
         if let Some((a, b)) = self.drag {
-            let r = egui::Rect::from_two_pos(a, b);
-            ui.painter().rect_filled(r, 4, YELLOW.gamma_multiply(0.15));
-            ui.painter().rect_stroke(
-                r,
-                4,
-                egui::Stroke::new(2.0_f32, YELLOW),
-                egui::StrokeKind::Inside,
-            );
+            let stroke = egui::Stroke::new(2.5_f32, YELLOW);
+            if kind == PickKind::Swipe {
+                painter.circle_filled(a, 5.0, YELLOW);
+                painter.arrow(a, b - a, stroke);
+            } else {
+                let r = egui::Rect::from_two_pos(a, b);
+                painter.rect_filled(r, 4, YELLOW.gamma_multiply(0.15));
+                painter.rect_stroke(r, 4, stroke, egui::StrokeKind::Inside);
+            }
         }
         if resp.drag_stopped() {
             if let Some((a, b)) = self.drag.take() {
                 let (fa, fb) = (to_frac(a), to_frac(b));
-                let f = [
-                    fa[0].min(fb[0]),
-                    fa[1].min(fb[1]),
-                    fa[0].max(fb[0]),
-                    fa[1].max(fb[1]),
-                ];
                 // Ignore clicks / tiny drags.
-                if f[2] - f[0] > 0.03 && f[3] - f[1] > 0.03 {
-                    return Some(f);
-                }
+                let (dx, dy) = ((fb[0] - fa[0]).abs(), (fb[1] - fa[1]).abs());
+                return match kind {
+                    PickKind::Swipe if dx.max(dy) > 0.03 => Some(Picked::Line(fa, fb)),
+                    PickKind::Region | PickKind::Image if dx > 0.01 && dy > 0.01 => {
+                        Some(Picked::Rect([fa[0].min(fb[0]), fa[1].min(fb[1]), fa[0].max(fb[0]), fa[1].max(fb[1])]))
+                    }
+                    _ => None,
+                };
             }
         }
         None
+    }
+}
+
+/// Small textures of saved button pictures, shown next to hand-made steps.
+#[derive(Default)]
+struct ThumbCache {
+    map: std::collections::HashMap<PathBuf, Option<TextureHandle>>,
+}
+
+impl ThumbCache {
+    fn get(&mut self, ctx: &egui::Context, path: PathBuf) -> Option<TextureHandle> {
+        self.map
+            .entry(path.clone())
+            .or_insert_with(|| {
+                let img = image::open(&path).ok()?.to_rgba8();
+                let color = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+                Some(ctx.load_texture(path.to_string_lossy(), color, egui::TextureOptions::LINEAR))
+            })
+            .clone()
     }
 }
 
@@ -184,6 +205,18 @@ enum TaskMsg {
     Compiled(Result<Vec<Node>, String>),
     /// Learned steps and the screen resolution they were recorded at.
     TrialDone(Result<(Vec<Node>, Option<[u32; 2]>), String>),
+    /// "Thử bước này" finished.
+    StepDone(Result<(), String>),
+}
+
+/// The step (and which part of it) whose point / picture / area is being picked.
+#[derive(Clone, PartialEq, Debug)]
+struct PickTarget {
+    /// Indices through loops.
+    path: Vec<usize>,
+    /// The step's "nếu không thấy thì" action rather than the step itself.
+    otherwise: bool,
+    kind: PickKind,
 }
 
 struct Task {
@@ -208,10 +241,11 @@ struct Editor {
     /// Some(..) after a trial run finished.
     trial: Option<Result<(), String>>,
     error: Option<String>,
-    /// Path of the step whose search area is being dragged out on the screenshot.
-    picking: Option<Vec<usize>>,
-    /// A screenshot being taken for picking search areas.
+    /// What is being picked on the screenshot, if anything.
+    picking: Option<PickTarget>,
+    /// A screenshot being taken (for picking).
     shot_rx: Option<Receiver<Result<RgbaImage, String>>>,
+    thumbs: ThumbCache,
 }
 
 impl Editor {
@@ -237,6 +271,7 @@ impl Editor {
             error: None,
             picking: None,
             shot_rx: None,
+            thumbs: ThumbCache::default(),
         }
     }
 
@@ -310,6 +345,72 @@ impl Editor {
         });
     }
 
+    /// "Thử bước này": runs one step on the emulator right away. Nothing is saved.
+    fn start_test_step(&mut self, ld: PathBuf, inst: Instance, node: Node) {
+        self.error = None;
+        let (tx, rx) = channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ai, dir, stop2) = (self.ai.clone(), self.sc.dir(), stop.clone());
+        std::thread::spawn(move || {
+            let r = (|| -> anyhow::Result<()> {
+                let log_tx = tx.clone();
+                let log = move |s: String| {
+                    let _ = log_tx.send(TaskMsg::Event(Event::Log(s)));
+                };
+                let mut nodes = vec![node];
+                compile_nodes(&ai, &mut nodes, &log)?;
+                let (etx, erx) = channel::<Event>();
+                let fwd = tx.clone();
+                std::thread::spawn(move || {
+                    while let Ok(e) = erx.recv() {
+                        let _ = fwd.send(TaskMsg::Event(e));
+                    }
+                });
+                let mut runner = executor::new_runner(&ld, inst, dir, ai, true, stop2, etx);
+                runner.ensure_device()?;
+                runner.run(&mut nodes)
+            })();
+            let _ = tx.send(TaskMsg::StepDone(r.map_err(|e| format!("{e:#}"))));
+        });
+        self.task = Some(Task { rx, stop, label: "Đang thử bước...", analyse_only: false });
+    }
+
+    /// Applies a finished pick to its step. Button pictures are cut from the screenshot
+    /// and saved in the scenario folder.
+    fn apply_pick(&mut self, target: &PickTarget, picked: Picked) -> Result<(), String> {
+        let dir = self.sc.dir();
+        let screen = self.screen.img.clone();
+        let node = target_node(&mut self.sc.steps, target).ok_or("Bước này không còn nữa")?;
+        match (target.kind, picked) {
+            (PickKind::Region, Picked::Rect(r)) => node.region = Some(r),
+            (PickKind::Point, Picked::Point([x, y])) => node.step = Some(Step::TapPoint { x, y }),
+            (PickKind::Swipe, Picked::Line(from, to)) => {
+                let ms = match node.step {
+                    Some(Step::Swipe { ms, .. }) => ms,
+                    _ => 400,
+                };
+                node.step = Some(Step::Swipe { from, to, ms });
+            }
+            (PickKind::Image, Picked::Rect(r)) => {
+                let img = screen.ok_or("Chưa có ảnh màn hình")?;
+                let (w, h) = (img.width() as f32, img.height() as f32);
+                let (x, y) = ((r[0] * w) as u32, (r[1] * h) as u32);
+                let (cw, ch) = ((((r[2] - r[0]) * w) as u32).max(8), (((r[3] - r[1]) * h) as u32).max(8));
+                let (cw, ch) = (cw.min(img.width() - x), ch.min(img.height() - y));
+                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                let name = format!("tpl_{}.png", uuid::Uuid::new_v4().simple());
+                image::imageops::crop_imm(&img, x, y, cw, ch).to_image().save(dir.join(&name)).map_err(|e| e.to_string())?;
+                let rec = script::Rec { template: name, x, y };
+                match &mut node.step {
+                    Some(Step::TapImage { rec: old, .. } | Step::WaitImage { rec: old, .. }) => *old = rec,
+                    _ => node.step = Some(Step::TapImage { all: false, max: 30, rec }),
+                }
+            }
+            _ => return Err("Kiểu chọn không khớp với bước".into()),
+        }
+        Ok(())
+    }
+
     /// Grabs the emulator's current screen in the background (for picking search areas).
     fn capture(&mut self, ld: PathBuf, inst: Instance) {
         let (tx, rx) = channel();
@@ -350,6 +451,13 @@ impl Editor {
                     finished = true;
                     self.error = Some(e);
                 }
+                TaskMsg::StepDone(r) => {
+                    finished = true;
+                    match r {
+                        Ok(()) => jobs::push_log(&mut self.log, "Thử bước xong.".into()),
+                        Err(e) => jobs::push_log(&mut self.log, format!("Thử bước lỗi: {e}")),
+                    }
+                }
                 TaskMsg::TrialDone(r) => {
                     finished = true;
                     match r {
@@ -386,14 +494,19 @@ fn ensure_ai(ai: &SharedAi, log: &dyn Fn(String)) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Removes empty rows and empty loops.
+/// Removes empty rows and empty loops (hand-made steps are never empty).
 fn prune_empty(nodes: &mut Vec<Node>) {
-    nodes.retain_mut(|n| match &mut n.step {
-        Some(Step::Loop { steps, .. }) => {
-            prune_empty(steps);
-            !steps.is_empty()
+    nodes.retain_mut(|n| {
+        if n.otherwise.as_ref().is_some_and(|o| !o.manual && o.text.trim().is_empty()) {
+            n.otherwise = None;
         }
-        _ => !n.text.trim().is_empty(),
+        match &mut n.step {
+            Some(Step::Loop { steps, .. }) => {
+                prune_empty(steps);
+                !steps.is_empty()
+            }
+            _ => n.manual || !n.text.trim().is_empty(),
+        }
     });
 }
 
@@ -528,7 +641,7 @@ impl App {
                 app.instances.iter().find(|i| i.running),
             ) {
                 ed.capture(ld.clone(), inst.clone());
-                ed.picking = Some(vec![1, 0]);
+                ed.picking = Some(PickTarget { path: vec![1, 0], otherwise: false, kind: PickKind::Image });
             }
             app.editor = Some(ed);
         }
@@ -974,7 +1087,7 @@ impl App {
         ui.columns(2, |cols| {
             cols[0].label(theme::muted(format!("Số lượt đã xong: {}", job.runs)));
             log_ui(&mut cols[0], &job.log);
-            self.job_screen.ui(&mut cols[1], None, false);
+            self.job_screen.ui(&mut cols[1], None, None);
         });
     }
 
@@ -1125,22 +1238,17 @@ impl App {
                             ui.label(theme::title(format!("{} Các bước", ic::LIST_NUMBERS)));
                             ui.label(theme::muted("Mỗi ô là một bước, viết như nói chuyện. vd: \"bấm xuất chiến góc phải dưới\", \"chọn ải mới nhất\", \"đợi đánh xong\", \"chờ 3 giây\"."));
                             ui.add_space(6.0);
-                            let mut st = StepsUi { counter: 0, changed: false, picking: ed.picking.as_deref(), pick_request: None };
+                            let dir = ed.sc.dir();
+                            let mut st = StepsUi { counter: 0, changed: false, picking: ed.picking.as_ref(), pick_request: None, test_request: None, thumbs: &mut ed.thumbs, dir };
                             nodes_ui(ui, &mut ed.sc.steps, &mut Vec::new(), &mut st);
-                            let (mut changed, pick_request) = (st.changed, st.pick_request);
-                            if let Some(path) = pick_request {
-                                // Clicking "Vùng tìm" again cancels.
-                                ed.picking = if ed.picking.as_ref() == Some(&path) { None } else { Some(path) };
-                                if ed.picking.is_some() && ed.screen.tex.is_none() {
-                                    if let (Some(ld), Some(inst)) = (&ld_dir, instances.iter().find(|i| i.index == ed.sc.instance_index)) {
-                                        ed.capture(ld.clone(), inst.clone());
-                                    }
-                                }
-                            }
+                            let (mut changed, mut pick_request, test_request) = (st.changed, st.pick_request, st.test_request);
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
-                                if ui.button(format!("{} Thêm bước", ic::PLUS)).clicked() {
-                                    ed.sc.steps.push(Node::new());
+                                if let Some((new, kind)) = add_step_menu(ui, format!("{} Thêm bước", ic::PLUS)) {
+                                    ed.sc.steps.push(new);
+                                    if let Some(kind) = kind {
+                                        pick_request = Some(PickTarget { path: vec![ed.sc.steps.len() - 1], otherwise: false, kind });
+                                    }
                                     changed = true;
                                 }
                                 if ui.button(format!("{} Thêm vòng lặp", ic::REPEAT)).on_hover_text("Lặp lại một nhóm bước, vd: đánh hết các map").clicked() {
@@ -1150,6 +1258,22 @@ impl App {
                             });
                             if changed {
                                 ed.trial = None;
+                            }
+                            let inst = instances.iter().find(|i| i.index == ed.sc.instance_index).cloned();
+                            if let Some(t) = pick_request {
+                                // Asking for the same pick again cancels it.
+                                ed.picking = if ed.picking.as_ref() == Some(&t) { None } else { Some(t) };
+                                if ed.picking.is_some() && ed.screen.tex.is_none() {
+                                    if let (Some(ld), Some(inst)) = (&ld_dir, &inst) {
+                                        ed.capture(ld.clone(), inst.clone());
+                                    }
+                                }
+                            }
+                            if let Some(node) = test_request {
+                                match (&ld_dir, inst) {
+                                    (Some(ld), Some(inst)) => ed.start_test_step(ld.clone(), inst, node),
+                                    _ => ed.error = Some("Chọn giả lập trước khi thử bước".into()),
+                                }
                             }
                             let n = script::dynamic_count(&ed.sc.steps);
                             if n > 0 {
@@ -1211,11 +1335,11 @@ impl App {
                     });
                     ui.add_space(4.0);
                     let picking = ed.picking.clone();
-                    let region = picking.as_ref().and_then(|p| node_at(&mut ed.sc.steps, p)).and_then(|n| n.region);
-                    if picking.is_some() {
+                    let region = picking.as_ref().filter(|p| p.kind == PickKind::Region).and_then(|p| node_at(&mut ed.sc.steps, &p.path)).and_then(|n| n.region);
+                    if let Some(p) = &picking {
                         theme::card_frame(YELLOW.gamma_multiply(0.6)).inner_margin(Margin::same(10)).show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                let text = format!("{} Kéo chuột trên ảnh để khoanh vùng AI được tìm cho bước này", ic::SELECTION);
+                                let text = format!("{} {}", ic::CURSOR_CLICK, p.kind.instruction());
                                 let text_width = ui.available_width() - 60.0; // room for "Hủy"
                                 ui.scope(|ui| {
                                     ui.set_max_width(text_width);
@@ -1228,10 +1352,12 @@ impl App {
                         });
                         ui.add_space(6.0);
                     }
-                    if let Some(new_region) = ed.screen.ui(ui, region, picking.is_some()) {
-                        if let Some(node) = picking.as_ref().and_then(|p| node_at(&mut ed.sc.steps, p)) {
-                            node.region = Some(new_region);
-                            ed.trial = None;
+                    if let Some(picked) = ed.screen.ui(ui, region, picking.as_ref().map(|p| p.kind)) {
+                        if let Some(t) = &picking {
+                            match ed.apply_pick(t, picked) {
+                                Ok(()) => ed.trial = None,
+                                Err(e) => ed.error = Some(e),
+                            }
                         }
                         ed.picking = None;
                     }
@@ -1283,16 +1409,14 @@ fn demo_scenario(instances: &[Instance]) -> Scenario {
         sc.instance_index = i.index;
     }
     let node = Node::with_text;
-    let mut pick = node("tìm phó bản không có chữ \"Hoàn toàn thu hồi\" click vào");
-    pick.otherwise = Some(Box::new(node(
-        "click mũi tên màu xanh góc phải để chuyển trang",
-    )));
-    pick.region = Some([0.27, 0.1, 0.97, 0.95]);
+    let mut challenge = Node::manual(Step::TapImage { all: false, max: 30, rec: empty_rec() });
+    challenge.text = "nút Khiêu chiến".into();
+    challenge.otherwise = Some(Box::new(Node::manual(Step::Swipe { from: [0.6, 0.8], to: [0.6, 0.3], ms: 400 })));
     let mut lp = Node::new_loop();
     if let Some(Step::Loop { steps, .. }) = &mut lp.step {
-        *steps = vec![pick, node("bấm tấn công"), node("đợi đánh xong")];
+        *steps = vec![challenge, node("đợi đánh xong"), Node::manual(Step::Wait { seconds: 2.0 })];
     }
-    sc.steps = vec![node("bấm xuất chiến góc phải dưới"), lp, node("thoát ra")];
+    sc.steps = vec![Node::manual(Step::TapPoint { x: 0.42, y: 0.12 }), lp, node("thoát ra")];
     sc
 }
 
@@ -1379,10 +1503,15 @@ struct StepsUi<'a> {
     /// Running step number shown in the badges.
     counter: usize,
     changed: bool,
-    /// Path (indices through loops) of the step whose search area is being picked.
-    picking: Option<&'a [usize]>,
-    /// Set when the user clicks "Vùng tìm" on a step.
-    pick_request: Option<Vec<usize>>,
+    /// What is being picked on the screenshot right now.
+    picking: Option<&'a PickTarget>,
+    /// Set when the user asks to pick something for a step.
+    pick_request: Option<PickTarget>,
+    /// Set when the user clicks "Thử bước này".
+    test_request: Option<Node>,
+    thumbs: &'a mut ThumbCache,
+    /// Scenario folder, where button pictures are stored.
+    dir: PathBuf,
 }
 
 /// Finds a node by its path of indices through loops.
@@ -1398,13 +1527,14 @@ fn node_at<'a>(nodes: &'a mut [Node], path: &[usize]) -> Option<&'a mut Node> {
     }
 }
 
+/// The node a pick is for: the step itself or its "nếu không thấy thì" action.
+fn target_node<'a>(nodes: &'a mut [Node], t: &PickTarget) -> Option<&'a mut Node> {
+    let node = node_at(nodes, &t.path)?;
+    if t.otherwise { node.otherwise.as_deref_mut() } else { Some(node) }
+}
+
 /// A growing, height-draggable text area for one step.
-fn step_text_box(
-    ui: &mut egui::Ui,
-    id: impl std::hash::Hash,
-    text: &mut String,
-    hint: &str,
-) -> bool {
+fn step_text_box(ui: &mut egui::Ui, id: impl std::hash::Hash, text: &mut String, hint: &str) -> bool {
     let w = ui.available_width();
     let mut changed = false;
     egui::Resize::default()
@@ -1417,11 +1547,7 @@ fn step_text_box(
         .min_height(40.0)
         .max_height(300.0)
         .show(ui, |ui| {
-            let edit = egui::TextEdit::multiline(text)
-                .hint_text(hint)
-                .margin(theme::INPUT_MARGIN)
-                .desired_rows(1)
-                .desired_width(w);
+            let edit = egui::TextEdit::multiline(text).hint_text(hint).margin(theme::INPUT_MARGIN).desired_rows(1).desired_width(w);
             changed = ui.add_sized(ui.available_size(), edit).changed();
         });
     changed
@@ -1430,13 +1556,8 @@ fn step_text_box(
 /// One line telling how the AI understood a step.
 fn interpretation(ui: &mut egui::Ui, node: &Node, indent: f32) {
     let (text, color) = match &node.step {
-        Some(s @ Step::Tap { dynamic: true, .. }) => {
-            (format!("{} {}", ic::LIGHTNING, s.describe()), YELLOW)
-        }
-        Some(s) => (
-            format!("{} {}", ic::ARROW_BEND_DOWN_RIGHT, s.describe()),
-            GREEN,
-        ),
+        Some(s @ Step::Tap { dynamic: true, .. }) => (format!("{} {}", ic::LIGHTNING, s.describe()), YELLOW),
+        Some(s) => (format!("{} {}", ic::ARROW_BEND_DOWN_RIGHT, s.describe()), GREEN),
         None if node.text.trim().is_empty() => return,
         None => ("AI chưa đọc bước này".to_string(), MUTED),
     };
@@ -1444,6 +1565,139 @@ fn interpretation(ui: &mut egui::Ui, node: &Node, indent: f32) {
         ui.add_space(indent);
         ui.add(egui::Label::new(RichText::new(text).size(12.5).color(color)).wrap());
     });
+}
+
+fn empty_rec() -> script::Rec {
+    script::Rec { template: String::new(), x: 0, y: 0 }
+}
+
+/// The kinds of step the user can add, and what has to be picked on the screen for each.
+fn new_step_kinds() -> Vec<(String, &'static str, fn() -> (Node, Option<PickKind>))> {
+    vec![
+        (format!("{} Viết bằng chữ (AI hiểu)", ic::PENCIL_SIMPLE), "Mô tả bước bằng tiếng Việt, AI tự tìm nút", || (Node::new(), None)),
+        (format!("{} Bấm vào nút (khoanh ảnh nút)", ic::IMAGE_SQUARE), "Khoanh quanh nút trên ảnh màn hình; mỗi lần chạy app tìm nút giống vậy rồi bấm", || {
+            (Node::manual(Step::TapImage { all: false, max: 30, rec: empty_rec() }), Some(PickKind::Image))
+        }),
+        (format!("{} Bấm hết các nút giống nhau", ic::COPY), "vd bấm hết các nút \"Nhận\" trên màn hình", || {
+            (Node::manual(Step::TapImage { all: true, max: 30, rec: empty_rec() }), Some(PickKind::Image))
+        }),
+        (format!("{} Bấm vào một điểm cố định", ic::HAND_TAP), "Bấm đúng một vị trí trên màn hình", || {
+            (Node::manual(Step::TapPoint { x: -1.0, y: -1.0 }), Some(PickKind::Point))
+        }),
+        (format!("{} Đợi đến khi thấy ảnh", ic::HOURGLASS), "Khoanh một phần màn hình; app đợi đến khi nó xuất hiện (vd chữ \"Chiến thắng\")", || {
+            (Node::manual(Step::WaitImage { timeout_sec: 300, rec: empty_rec() }), Some(PickKind::Image))
+        }),
+        (format!("{} Vuốt", ic::HAND_SWIPE_RIGHT), "Kéo từ điểm này đến điểm kia (vd cuộn danh sách)", || {
+            (Node::manual(Step::Swipe { from: [0.0, 0.0], to: [0.0, 0.0], ms: 400 }), Some(PickKind::Swipe))
+        }),
+        (format!("{} Chờ vài giây", ic::TIMER), "Nghỉ một lúc trước bước tiếp theo", || (Node::manual(Step::Wait { seconds: 2.0 }), None)),
+        (format!("{} Nhấn nút Back của Android", ic::ARROW_U_UP_LEFT), "Phím quay lại của điện thoại (một số game bỏ qua phím này)", || {
+            (Node::manual(Step::Back), None)
+        }),
+    ]
+}
+
+/// "Thêm bước" menu. Returns the new node and what still has to be picked for it.
+fn add_step_menu(ui: &mut egui::Ui, label: String) -> Option<(Node, Option<PickKind>)> {
+    let mut out = None;
+    ui.menu_button(label, |ui| {
+        for (i, (text, tip, make)) in new_step_kinds().into_iter().enumerate() {
+            if i == 1 {
+                ui.separator();
+                ui.label(RichText::new("Làm bằng tay trên màn hình (không cần AI)").size(12.5).color(MUTED));
+            }
+            if ui.button(text).on_hover_text(tip).clicked() {
+                out = Some(make());
+                ui.close();
+            }
+        }
+    });
+    out
+}
+
+fn step_icon(step: &Step) -> &'static str {
+    match step {
+        Step::TapPoint { .. } => ic::HAND_TAP,
+        Step::TapImage { all: true, .. } => ic::COPY,
+        Step::TapImage { .. } => ic::IMAGE_SQUARE,
+        Step::WaitImage { .. } => ic::HOURGLASS,
+        Step::Swipe { .. } => ic::HAND_SWIPE_RIGHT,
+        Step::Wait { .. } => ic::TIMER,
+        Step::Back => ic::ARROW_U_UP_LEFT,
+        _ => ic::PENCIL_SIMPLE,
+    }
+}
+
+fn pick_kind_of(step: &Step) -> Option<PickKind> {
+    match step {
+        Step::TapPoint { .. } => Some(PickKind::Point),
+        Step::TapImage { .. } | Step::WaitImage { .. } => Some(PickKind::Image),
+        Step::Swipe { .. } => Some(PickKind::Swipe),
+        _ => None,
+    }
+}
+
+/// Description, button picture and settings of a hand-made step.
+fn manual_body(ui: &mut egui::Ui, node: &mut Node, st: &mut StepsUi, path: &[usize], otherwise: bool) {
+    let Some(step) = node.step.as_mut() else { return };
+    let unset = step.needs_pick();
+    ui.horizontal_wrapped(|ui| {
+        let color = if unset { YELLOW } else { TEXT };
+        ui.label(RichText::new(format!("{} {}", step_icon(step), step.describe())).color(color).family(theme::bold()).size(14.0));
+        if let Some(rec) = step.image() {
+            if let Some(tex) = st.thumbs.get(ui.ctx(), st.dir.join(&rec.template)) {
+                let [w, h] = tex.size().map(|v| v as f32);
+                let scale = (34.0 / h).min(160.0 / w).min(1.5);
+                ui.add(egui::Image::new((tex.id(), vec2(w * scale, h * scale))).corner_radius(4))
+                    .on_hover_text("Ảnh nút đã khoanh");
+            }
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        if let Some(kind) = pick_kind_of(step) {
+            let picking_this = st.picking.is_some_and(|p| p.path == path && p.otherwise == otherwise && p.kind == kind);
+            let label = match (picking_this, unset) {
+                (true, _) => "Đang chọn trên màn hình…",
+                (false, true) => "Chọn trên màn hình",
+                (false, false) => "Chọn lại",
+            };
+            if ui.add(egui::Button::new(RichText::new(format!("{} {label}", ic::CURSOR_CLICK)).size(13.0)).small().selected(picking_this)).clicked() {
+                st.pick_request = Some(PickTarget { path: path.to_vec(), otherwise, kind });
+            }
+        }
+        let muted = |t: &str| RichText::new(t).size(13.0).color(MUTED);
+        let changed = match step {
+            Step::Wait { seconds } => {
+                ui.label(muted("chờ"));
+                let c = ui.add(egui::DragValue::new(seconds).range(0.5..=3600.0).speed(0.5)).changed();
+                ui.label(muted("giây"));
+                c
+            }
+            Step::TapImage { all: true, max, .. } => {
+                ui.label(muted("tối đa"));
+                let c = ui.add(egui::DragValue::new(max).range(1..=200)).changed();
+                ui.label(muted("lần"));
+                c
+            }
+            Step::WaitImage { timeout_sec, .. } => {
+                ui.label(muted("đợi tối đa"));
+                let c = ui.add(egui::DragValue::new(timeout_sec).range(1..=3600)).changed();
+                ui.label(muted("giây"));
+                c
+            }
+            Step::Swipe { ms, .. } => {
+                ui.label(muted("trong"));
+                let c = ui.add(egui::DragValue::new(ms).range(50..=5000).speed(10)).changed();
+                ui.label(muted("ms"));
+                c
+            }
+            _ => false,
+        };
+        st.changed |= changed;
+    });
+    if !otherwise {
+        ui.add(egui::TextEdit::singleline(&mut node.text).hint_text("ghi chú (không bắt buộc)").margin(Margin::symmetric(8, 4)).desired_width(f32::INFINITY));
+    }
 }
 
 /// Editable list of steps; loops render as nested blocks.
@@ -1457,18 +1711,10 @@ fn nodes_ui(ui: &mut egui::Ui, nodes: &mut Vec<Node>, path: &mut Vec<usize>, st:
             if ui.small_button(ic::TRASH).on_hover_text("Xóa").clicked() {
                 *action = Some(NodeAction::Remove(i));
             }
-            if ui
-                .add_enabled(i + 1 < len, egui::Button::new(ic::ARROW_DOWN).small())
-                .on_hover_text("Chuyển xuống")
-                .clicked()
-            {
+            if ui.add_enabled(i + 1 < len, egui::Button::new(ic::ARROW_DOWN).small()).on_hover_text("Chuyển xuống").clicked() {
                 *action = Some(NodeAction::Down(i));
             }
-            if ui
-                .add_enabled(i > 0, egui::Button::new(ic::ARROW_UP).small())
-                .on_hover_text("Chuyển lên")
-                .clicked()
-            {
+            if ui.add_enabled(i > 0, egui::Button::new(ic::ARROW_UP).small()).on_hover_text("Chuyển lên").clicked() {
                 *action = Some(NodeAction::Up(i));
             }
         };
@@ -1481,33 +1727,23 @@ fn nodes_ui(ui: &mut egui::Ui, nodes: &mut Vec<Node>, path: &mut Vec<usize>, st:
                 .inner_margin(Margin::same(12))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!("{} Lặp lại tối đa", ic::REPEAT))
-                                .color(ACCENT)
-                                .family(theme::bold()),
-                        );
+                        ui.label(RichText::new(format!("{} Lặp lại tối đa", ic::REPEAT)).color(ACCENT).family(theme::bold()));
                         if ui.add(egui::DragValue::new(max).range(1..=999)).changed() {
                             st.changed = true;
                         }
                         ui.label(RichText::new("lần").color(ACCENT).family(theme::bold()));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            row_buttons(ui, &mut action)
-                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| row_buttons(ui, &mut action));
                     });
-                    ui.label(
-                        RichText::new(
-                            "Tự dừng khi một bước bên trong không tìm thấy nút (vd hết map).",
-                        )
-                        .size(12.5)
-                        .color(MUTED),
-                    );
+                    ui.label(RichText::new("Tự dừng khi một bước bên trong không tìm thấy nút (vd hết map).").size(12.5).color(MUTED));
                     ui.add_space(4.0);
                     nodes_ui(ui, steps, path, st);
-                    if ui
-                        .button(format!("{} Thêm bước vào vòng lặp", ic::PLUS))
-                        .clicked()
-                    {
-                        steps.push(Node::new());
+                    if let Some((new, kind)) = add_step_menu(ui, format!("{} Thêm bước vào vòng lặp", ic::PLUS)) {
+                        steps.push(new);
+                        if let Some(kind) = kind {
+                            let mut p = path.clone();
+                            p.push(steps.len() - 1);
+                            st.pick_request = Some(PickTarget { path: p, otherwise: false, kind });
+                        }
                         st.changed = true;
                     }
                 });
@@ -1520,59 +1756,57 @@ fn nodes_ui(ui: &mut egui::Ui, nodes: &mut Vec<Node>, path: &mut Vec<usize>, st:
         let number = st.counter;
         ui.horizontal_top(|ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(26.0, 38.0), egui::Sense::hover());
-            ui.painter().circle_filled(
-                rect.center(),
-                12.0,
-                if node.step.is_some() {
-                    ACCENT.gamma_multiply(0.35)
-                } else {
-                    BORDER
-                },
-            );
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                number.to_string(),
-                egui::FontId::new(13.0, theme::bold()),
-                TEXT,
-            );
-            // Buttons first (right to left) so the text box takes exactly what is left.
+            let done = node.step.as_ref().is_some_and(|s| !s.needs_pick());
+            ui.painter().circle_filled(rect.center(), 12.0, if done { ACCENT.gamma_multiply(0.35) } else { BORDER });
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, number.to_string(), egui::FontId::new(13.0, theme::bold()), TEXT);
+            // Buttons first (right to left) so the content takes exactly what is left.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                 row_buttons(ui, &mut action);
-                let hint = if in_loop {
-                    "vd: chọn ải mới nhất"
-                } else {
-                    "vd: bấm xuất chiến góc phải dưới"
-                };
-                if step_text_box(ui, ("step-box", number), &mut node.text, hint) {
-                    node.step = None;
-                    st.changed = true;
-                }
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    if node.manual {
+                        manual_body(ui, node, st, path, false);
+                    } else {
+                        let hint = if in_loop { "vd: chọn ải mới nhất" } else { "vd: bấm xuất chiến góc phải dưới" };
+                        if step_text_box(ui, ("step-box", number), &mut node.text, hint) {
+                            node.step = None;
+                            st.changed = true;
+                        }
+                    }
+                });
             });
         });
-        interpretation(ui, node, 34.0);
+        if !node.manual {
+            interpretation(ui, node, 34.0);
+        }
 
-        // Extras: search area and "nếu không thấy thì…".
-        ui.horizontal(|ui| {
+        // Extras: test, search area, "nếu không thấy thì…".
+        let searches = !node.manual || matches!(node.step, Some(Step::TapImage { .. } | Step::WaitImage { .. }));
+        let can_fallback = !node.manual || matches!(node.step, Some(Step::TapImage { all: false, .. }));
+        ui.horizontal_wrapped(|ui| {
             ui.add_space(30.0);
-            let picking_this = st.picking == Some(path.as_slice());
-            let label = match (picking_this, node.region.is_some()) {
-                (true, _) => format!("{} Đang chọn vùng…", ic::SELECTION),
-                (false, true) => format!("{} Vùng tìm ✓", ic::SELECTION),
-                (false, false) => format!("{} Vùng tìm", ic::SELECTION),
-            };
-            let tip = "Kéo chuột trên ảnh màn hình để AI chỉ tìm trong vùng đó (tránh nhầm với chỗ khác)";
-            let selected = picking_this || node.region.is_some();
-            if ui.add(egui::Button::new(RichText::new(label).size(13.0)).small().selected(selected)).on_hover_text(tip).clicked() {
-                st.pick_request = Some(path.clone());
+            let small = |t: String| egui::Button::new(RichText::new(t).size(13.0)).small();
+            if ui.add(small(format!("{} Thử bước này", ic::PLAY))).on_hover_text("Chạy riêng bước này trên giả lập ngay bây giờ").clicked() {
+                st.test_request = Some(node.clone());
             }
-            if node.region.is_some() && ui.small_button(ic::X).on_hover_text("Bỏ vùng tìm (tìm cả màn hình)").clicked() {
-                node.region = None;
-                st.changed = true;
+            if searches {
+                let picking_this = st.picking.is_some_and(|p| p.path == *path && p.kind == PickKind::Region);
+                let label = match (picking_this, node.region.is_some()) {
+                    (true, _) => format!("{} Đang chọn vùng…", ic::SELECTION),
+                    (false, true) => format!("{} Vùng tìm ✓", ic::SELECTION),
+                    (false, false) => format!("{} Vùng tìm", ic::SELECTION),
+                };
+                let tip = "Kéo chuột trên ảnh màn hình để chỉ tìm trong vùng đó (tránh nhầm với chỗ khác)";
+                if ui.add(small(label).selected(picking_this || node.region.is_some())).on_hover_text(tip).clicked() {
+                    st.pick_request = Some(PickTarget { path: path.clone(), otherwise: false, kind: PickKind::Region });
+                }
+                if node.region.is_some() && ui.small_button(ic::X).on_hover_text("Bỏ vùng tìm (tìm cả màn hình)").clicked() {
+                    node.region = None;
+                    st.changed = true;
+                }
             }
-            if node.otherwise.is_none() {
-                let btn = egui::Button::new(RichText::new(format!("{} Nếu không thấy thì…", ic::ARROW_ELBOW_DOWN_RIGHT)).size(13.0)).small();
-                if ui.add(btn).on_hover_text("Làm một việc khác khi không tìm thấy (vd bấm mũi tên sang trang) rồi tìm lại").clicked() {
+            if can_fallback && node.otherwise.is_none() {
+                let tip = "Làm một việc khác khi không tìm thấy (vd bấm mũi tên sang trang) rồi tìm lại";
+                if ui.add(small(format!("{} Nếu không thấy thì…", ic::ARROW_ELBOW_DOWN_RIGHT))).on_hover_text(tip).clicked() {
                     node.otherwise = Some(Box::new(Node::new()));
                     st.changed = true;
                 }
@@ -1580,70 +1814,57 @@ fn nodes_ui(ui: &mut egui::Ui, nodes: &mut Vec<Node>, path: &mut Vec<usize>, st:
         });
 
         let mut remove_otherwise = false;
+        let mut replace_otherwise: Option<(Node, Option<PickKind>)> = None;
         if let Some(other) = node.otherwise.as_deref_mut() {
             ui.horizontal_top(|ui| {
                 ui.add_space(30.0);
                 let width = ui.available_width() - 20.0; // minus the frame's inner margin
-                egui::Frame::new()
-                    .fill(theme::INPUT.gamma_multiply(0.6))
-                    .corner_radius(8)
-                    .inner_margin(Margin::same(10))
-                    .show(ui, |ui| {
-                        // The parent row is horizontal; lay the block out top to bottom.
-                        ui.vertical(|ui| {
-                            ui.set_width(width);
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{} Nếu không thấy thì",
-                                        ic::ARROW_ELBOW_DOWN_RIGHT
-                                    ))
-                                    .color(ACCENT)
-                                    .family(theme::bold())
-                                    .size(13.5),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui.small_button(ic::X).on_hover_text("Bỏ").clicked() {
-                                            remove_otherwise = true;
-                                        }
-                                    },
-                                );
+                egui::Frame::new().fill(theme::INPUT.gamma_multiply(0.6)).corner_radius(8).inner_margin(Margin::same(10)).show(ui, |ui| {
+                    // The parent row is horizontal; lay the block out top to bottom.
+                    ui.vertical(|ui| {
+                        ui.set_width(width);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("{} Nếu không thấy thì", ic::ARROW_ELBOW_DOWN_RIGHT)).color(ACCENT).family(theme::bold()).size(13.5));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button(ic::X).on_hover_text("Bỏ").clicked() {
+                                    remove_otherwise = true;
+                                }
+                                replace_otherwise = add_step_menu(ui, format!("{} Đổi cách", ic::SWAP));
                             });
-                            if step_text_box(
-                                ui,
-                                ("otherwise-box", number),
-                                &mut other.text,
-                                "vd: bấm mũi tên màu xanh góc phải để sang trang",
-                            ) {
+                        });
+                        if other.manual {
+                            manual_body(ui, other, st, path, true);
+                        } else {
+                            let hint = "vd: bấm mũi tên màu xanh góc phải để sang trang";
+                            if step_text_box(ui, ("otherwise-box", number), &mut other.text, hint) {
                                 other.step = None;
                                 st.changed = true;
                             }
                             interpretation(ui, other, 0.0);
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("rồi tìm lại, tối đa").size(13.0).color(MUTED),
-                                );
-                                if ui
-                                    .add(
-                                        egui::DragValue::new(&mut node.otherwise_max).range(1..=99),
-                                    )
-                                    .changed()
-                                {
-                                    st.changed = true;
-                                }
-                                ui.label(RichText::new("lần").size(13.0).color(MUTED));
-                            });
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("rồi tìm lại, tối đa").size(13.0).color(MUTED));
+                            if ui.add(egui::DragValue::new(&mut node.otherwise_max).range(1..=99)).changed() {
+                                st.changed = true;
+                            }
+                            ui.label(RichText::new("lần").size(13.0).color(MUTED));
                         });
                     });
+                });
             });
         }
         if remove_otherwise {
             node.otherwise = None;
             st.changed = true;
         }
-        ui.add_space(6.0);
+        if let Some((new, kind)) = replace_otherwise {
+            node.otherwise = Some(Box::new(new));
+            if let Some(kind) = kind {
+                st.pick_request = Some(PickTarget { path: path.clone(), otherwise: true, kind });
+            }
+            st.changed = true;
+        }
+        ui.add_space(8.0);
         path.pop();
     }
     match action {

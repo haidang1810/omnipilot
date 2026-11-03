@@ -82,6 +82,34 @@ pub enum Step {
         max: u32,
         steps: Vec<Node>,
     },
+    // ---- Steps set up by hand on the screenshot (no AI). ----
+    /// Tap a fixed point, as fractions of the screen size.
+    TapPoint { x: f32, y: f32 },
+    /// Tap wherever the saved picture of a button is found (`all`: every copy of it).
+    TapImage {
+        #[serde(default)]
+        all: bool,
+        #[serde(default = "d_max_tap_all")]
+        max: u32,
+        rec: Rec,
+    },
+    /// Wait until the saved picture shows up.
+    WaitImage {
+        #[serde(default = "d_timeout")]
+        timeout_sec: u32,
+        rec: Rec,
+    },
+    /// Swipe between two points (fractions of the screen size).
+    Swipe {
+        from: [f32; 2],
+        to: [f32; 2],
+        #[serde(default = "d_swipe_ms")]
+        ms: u32,
+    },
+}
+
+fn d_swipe_ms() -> u32 {
+    400
 }
 
 /// One row of the scenario editor.
@@ -102,6 +130,9 @@ pub struct Node {
     /// Part of the screen to search, as fractions [x1, y1, x2, y2] of its size.
     #[serde(default)]
     pub region: Option<[f32; 4]>,
+    /// Set up by hand on the screenshot: `step` is fixed and `text` is only a note.
+    #[serde(default)]
+    pub manual: bool,
 }
 
 fn d_otherwise_max() -> u32 {
@@ -120,7 +151,13 @@ impl Node {
             otherwise: None,
             otherwise_max: d_otherwise_max(),
             region: None,
+            manual: false,
         }
+    }
+
+    /// A step set up by hand (see `Step::needs_pick` for ones still missing their position).
+    pub fn manual(step: Step) -> Self {
+        Self { step: Some(step), manual: true, ..Self::new() }
     }
 
     pub fn new_loop() -> Self {
@@ -181,6 +218,36 @@ impl Step {
             Step::Wait { seconds } => format!("Chờ {seconds} giây"),
             Step::Back => "Nhấn Back".to_string(),
             Step::Loop { max, .. } => format!("Lặp tối đa {max} lần"),
+            _ if self.needs_pick() => "Chưa chọn vị trí trên màn hình".to_string(),
+            Step::TapPoint { x, y } => format!("Bấm điểm ({:.0}%, {:.0}%)", x * 100.0, y * 100.0),
+            Step::TapImage { all: false, .. } => "Bấm vào nút giống ảnh".to_string(),
+            Step::TapImage { all: true, max, .. } => format!("Bấm hết các nút giống ảnh (tối đa {max})"),
+            Step::WaitImage { timeout_sec, .. } => format!("Đợi đến khi thấy ảnh (tối đa {timeout_sec}s)"),
+            Step::Swipe { from, to, .. } => format!(
+                "Vuốt từ ({:.0}%, {:.0}%) đến ({:.0}%, {:.0}%)",
+                from[0] * 100.0,
+                from[1] * 100.0,
+                to[0] * 100.0,
+                to[1] * 100.0
+            ),
+        }
+    }
+
+    /// A hand-made step whose point / picture / swipe has not been chosen yet.
+    pub fn needs_pick(&self) -> bool {
+        match self {
+            Step::TapPoint { x, .. } => *x < 0.0,
+            Step::TapImage { rec, .. } | Step::WaitImage { rec, .. } => rec.template.is_empty(),
+            Step::Swipe { from, to, .. } => from == to,
+            _ => false,
+        }
+    }
+
+    /// The saved button picture of a hand-made step, if any.
+    pub fn image(&self) -> Option<&Rec> {
+        match self {
+            Step::TapImage { rec, .. } | Step::WaitImage { rec, .. } if !rec.template.is_empty() => Some(rec),
+            _ => None,
         }
     }
 
@@ -516,7 +583,12 @@ fn collect_templates(nodes: &[Node], out: &mut Vec<String>) {
                 | Step::WaitUntil { rec: Some(r), .. },
             ) => out.push(r.template.clone()),
             Some(Step::Loop { steps, .. }) => collect_templates(steps, out),
-            _ => {}
+            Some(s) => {
+                if let Some(r) = s.image() {
+                    out.push(r.template.clone());
+                }
+            }
+            None => {}
         }
     }
 }

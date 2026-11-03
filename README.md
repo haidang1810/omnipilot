@@ -19,10 +19,13 @@ Không cần cắt ảnh nút, không cần ghi tọa độ. AI chạy ngay trê
 2. Bấm **Tạo kịch bản**:
    - Đặt tên, chọn giả lập.
    - Chọn kiểu chạy: **Lặp lại liên tục** (có thể nghỉ X phút giữa các lượt), **Chạy theo giờ** (vd `08:00, 20:30` để tranh tài nguyên, làm nhiệm vụ hằng ngày) hoặc **Chạy 1 lần** (chạy hết các bước một lượt rồi tự dừng).
-   - **Thêm bước**: mỗi ô là một bước, viết như nói chuyện ("bấm xuất chiến góc phải dưới", "đợi đánh xong", "chờ 3 giây", "nhận hết quà", "thoát ra").
+   - **Thêm bước** có 2 cách:
+     - **Làm bằng tay trên ảnh màn hình (không cần AI, chính xác nhất)**: *Bấm vào nút* (khoanh quanh nút, mỗi lần chạy app tìm nút giống vậy rồi bấm), *Bấm hết các nút giống nhau*, *Bấm vào một điểm*, *Đợi đến khi thấy ảnh*, *Vuốt*, *Chờ vài giây*, *Nút Back*. Bấm **Chụp màn hình** để lấy màn hình giả lập rồi bấm/khoanh/kéo trực tiếp lên ảnh.
+     - **Viết bằng chữ (AI hiểu)**: mỗi ô là một bước, viết như nói chuyện ("bấm xuất chiến góc phải dưới", "đợi đánh xong", "chờ 3 giây", "nhận hết quà", "thoát ra").
    - **Thêm vòng lặp**: lặp một nhóm bước (vd đánh hết các map). Vòng lặp tự dừng khi một bước bên trong không tìm thấy nút.
    - Điều kiện và trường hợp không thấy, viết luôn trong câu: *"tìm phó bản không có chữ "Hoàn toàn thu hồi" click vào, nếu không có thì click mũi tên màu xanh góc phải để chuyển trang"*. App giữ nguyên câu khi tìm, tự đọc chữ để loại các ô có chữ cấm, và tách phần "nếu không có thì…" thành mục **Nếu không thấy thì** (làm việc đó rồi tìm lại, tối đa N lần).
    - **Vùng tìm**: kéo chuột trên ảnh màn hình để AI chỉ tìm trong vùng đó, tránh nhầm với chỗ khác (vd tab bên cạnh bản đồ).
+   - **Thử bước này**: chạy riêng một bước trên giả lập ngay lúc soạn.
    - **Xem AI hiểu thế nào** (tùy chọn): AI đọc từng bước, hiện cách hiểu bên dưới mỗi ô, chưa bấm gì vào game.
    - **Chạy thử**: AI chạy thật trên giả lập, bạn xem màn hình và nhật ký ngay trong app. Lần này chậm vì AI phải nhìn từng màn hình.
    - Chạy đúng → **Lưu kịch bản**. AI tắt, giải phóng RAM.
@@ -68,6 +71,8 @@ omnipilot.exe --find man-hinh.png "tìm phó bản không có chữ \"Đã qua\"
 omnipilot.exe --analyse "bấm xuất chiến góc phải dưới" "đợi đánh xong"
 # Chạy thử bằng AI → xuất/nhập → chạy lại bản đã nhập không cần AI
 omnipilot.exe --cli <số thứ tự giả lập> "vô túi đồ" "thoát ra"
+# Chạy một kịch bản đã lưu (như khi chạy theo lịch)
+omnipilot.exe --run <số thứ tự giả lập> "%LOCALAPPDATA%\OmniPilot\scenarios\<id>"
 # Mở thẳng màn hình tạo kịch bản với ví dụ mẫu
 omnipilot.exe --demo
 ```

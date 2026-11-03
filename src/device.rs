@@ -175,4 +175,12 @@ impl Device {
         self.adb(&["shell", "input", "keyevent", "4"])?;
         Ok(())
     }
+
+    pub fn swipe(&self, from: (u32, u32), to: (u32, u32), ms: u32) -> Result<()> {
+        let args = [from.0, from.1, to.0, to.1, ms].map(|v| v.to_string());
+        let mut full = vec!["shell", "input", "swipe"];
+        full.extend(args.iter().map(String::as_str));
+        self.adb(&full)?;
+        Ok(())
+    }
 }

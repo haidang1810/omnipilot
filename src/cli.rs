@@ -107,6 +107,30 @@ pub fn find(png_path: &str, text: &str, region: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// `--run <giả lập> <thư mục kịch bản>`: replays a saved scenario like a scheduled run.
+pub fn run_saved(index: u32, dir: &str) -> Result<()> {
+    let ld = device::find_ldplayer().context("không tìm thấy LDPlayer")?;
+    let inst = device::list_instances(&ld)?.into_iter().find(|i| i.index == index).context("không có instance này")?;
+    let json = std::fs::read_to_string(std::path::Path::new(dir).join("scenario.json"))?;
+    let mut sc: Scenario = serde_json::from_str(json.trim_start_matches('\u{feff}'))?;
+    let (tx, rx) = channel::<Event>();
+    std::thread::spawn(move || {
+        while let Ok(e) = rx.recv() {
+            if let Event::Log(l) = e {
+                println!("  {l}");
+            }
+        }
+    });
+    let ai = Arc::new(Mutex::new(None));
+    let t = Instant::now();
+    let mut runner = executor::new_runner(&ld, inst, dir.into(), ai.clone(), false, Arc::new(AtomicBool::new(false)), tx);
+    runner.ensure_device()?;
+    let result = runner.run(&mut sc.steps);
+    drop(runner);
+    println!("Xong sau {:.1}s, AI có bị bật: {}", t.elapsed().as_secs_f32(), ai.lock().unwrap().is_some());
+    result
+}
+
 pub fn run(index: u32, texts: &[String]) -> Result<()> {
     let ld = device::find_ldplayer().context("không tìm thấy LDPlayer")?;
     let inst = device::list_instances(&ld)?
