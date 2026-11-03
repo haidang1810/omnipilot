@@ -450,7 +450,7 @@ impl App {
             theme::card_frame(RED).show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(format!("{} {err}", ic::WARNING)).color(RED));
-                    ui.add(egui::TextEdit::singleline(&mut self.ld_text).hint_text("D:\\LDPlayer\\LDPlayer9").desired_width(260.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.ld_text).hint_text("D:\\LDPlayer\\LDPlayer9").margin(theme::INPUT_MARGIN).desired_width(260.0));
                     if ui.button("Lưu").clicked() {
                         let dir = PathBuf::from(self.ld_text.trim());
                         if device::is_ldplayer_dir(&dir) {
@@ -732,7 +732,7 @@ impl App {
                             ui.label(theme::title(format!("{} Thông tin", ic::SLIDERS_HORIZONTAL)));
                             ui.add_space(4.0);
                             ui.label(theme::muted("Tên kịch bản"));
-                            ui.add(egui::TextEdit::singleline(&mut ed.sc.name).hint_text("vd: Đánh map cốt truyện").desired_width(f32::INFINITY));
+                            ui.add(egui::TextEdit::singleline(&mut ed.sc.name).hint_text("vd: Đánh map cốt truyện").margin(theme::INPUT_MARGIN).desired_width(f32::INFINITY));
                             ui.add_space(4.0);
                             ui.label(theme::muted("Giả lập"));
                             let text = instances.iter().find(|i| i.index == ed.sc.instance_index).map(|i| i.name.clone()).unwrap_or("(chọn giả lập)".into());
@@ -864,7 +864,11 @@ fn demo_scenario(instances: &[Instance]) -> Scenario {
     if let Some(Step::Loop { steps, .. }) = &mut lp.step {
         *steps = vec![node("chọn ải mới nhất"), node("bấm tấn công"), node("đợi đánh xong"), node("bấm tiếp tục")];
     }
-    sc.steps = vec![node("bấm xuất chiến góc phải dưới"), lp, node("thoát ra")];
+    sc.steps = vec![
+        node("bấm xuất chiến góc phải dưới, nếu có bảng thông báo sự kiện hiện ra thì đóng nó trước rồi mới bấm xuất chiến"),
+        lp,
+        node("thoát ra"),
+    ];
     sc
 }
 
@@ -882,7 +886,7 @@ fn schedule_ui(ui: &mut egui::Ui, ed: &mut Editor) {
         Schedule::Repeat { pause_minutes } => {
             ui.horizontal(|ui| {
                 ui.label(theme::muted("Nghỉ giữa các lượt"));
-                if ui.add(egui::TextEdit::singleline(&mut ed.pause_text).desired_width(48.0)).changed() {
+                if ui.add(egui::TextEdit::singleline(&mut ed.pause_text).margin(theme::INPUT_MARGIN).desired_width(48.0)).changed() {
                     *pause_minutes = ed.pause_text.trim().parse().unwrap_or(0);
                 }
                 ui.label(theme::muted("phút (0 = chạy liên tục)"));
@@ -891,7 +895,7 @@ fn schedule_ui(ui: &mut egui::Ui, ed: &mut Editor) {
         Schedule::Daily { times } => {
             ui.horizontal(|ui| {
                 ui.label(theme::muted("Giờ chạy"));
-                if ui.add(egui::TextEdit::singleline(&mut ed.times_text).hint_text("08:00, 20:30").desired_width(180.0)).changed() {
+                if ui.add(egui::TextEdit::singleline(&mut ed.times_text).hint_text("08:00, 20:30").margin(theme::INPUT_MARGIN).desired_width(180.0)).changed() {
                     *times = jobs::parse_times(&ed.times_text);
                 }
             });
@@ -953,19 +957,33 @@ fn nodes_ui(ui: &mut egui::Ui, nodes: &mut Vec<Node>, in_loop: bool, counter: &m
         }
 
         *counter += 1;
-        ui.horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(vec2(26.0, 30.0), egui::Sense::hover());
+        ui.horizontal_top(|ui| {
+            let (rect, _) = ui.allocate_exact_size(vec2(26.0, 38.0), egui::Sense::hover());
             ui.painter().circle_filled(rect.center(), 12.0, if node.step.is_some() { ACCENT.gamma_multiply(0.35) } else { BORDER });
             ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, counter.to_string(), egui::FontId::new(13.0, theme::bold()), TEXT);
             // Buttons first (right to left) so the text box takes exactly what is left.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                 row_buttons(ui, &mut action);
+                let w = ui.available_width();
                 let hint = if in_loop { "vd: chọn ải mới nhất" } else { "vd: bấm xuất chiến góc phải dưới" };
-                let edit = egui::TextEdit::singleline(&mut node.text).hint_text(hint).margin(Margin::symmetric(8, 6));
-                if ui.add_sized([ui.available_width(), 30.0], edit).changed() {
-                    node.step = None;
-                    *changed = true;
-                }
+                // Text area: wraps and grows with the text, and its height can be dragged
+                // from the bottom-right corner.
+                egui::Resize::default()
+                    .id_salt(("step-box", *counter))
+                    .resizable([false, true])
+                    .with_stroke(false)
+                    .min_width(w)
+                    .max_width(w)
+                    .default_size(vec2(w, 40.0))
+                    .min_height(40.0)
+                    .max_height(300.0)
+                    .show(ui, |ui| {
+                        let edit = egui::TextEdit::multiline(&mut node.text).hint_text(hint).margin(theme::INPUT_MARGIN).desired_rows(1).desired_width(w);
+                        if ui.add_sized(ui.available_size(), edit).changed() {
+                            node.step = None;
+                            *changed = true;
+                        }
+                    });
             });
         });
         let (text, color) = match &node.step {

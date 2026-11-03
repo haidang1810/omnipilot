@@ -18,6 +18,9 @@ pub const GREEN: Color32 = Color32::from_rgb(0x34, 0xd3, 0x99);
 pub const RED: Color32 = Color32::from_rgb(0xf8, 0x71, 0x71);
 pub const YELLOW: Color32 = Color32::from_rgb(0xfb, 0xbf, 0x24);
 
+/// Inner padding of every text box (egui's default is very tight).
+pub const INPUT_MARGIN: Margin = Margin::symmetric(10, 8);
+
 pub fn bold() -> FontFamily {
     FontFamily::Name("bold".into())
 }
