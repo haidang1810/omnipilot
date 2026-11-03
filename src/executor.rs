@@ -15,7 +15,7 @@ use image::RgbaImage;
 
 use crate::ai::{AiServer, Rect};
 use crate::device::{self, Device, Frame, Instance};
-use crate::script::{self, Rec, Step};
+use crate::script::{self, Node, Rec, Step};
 use crate::vision;
 
 pub type SharedAi = Arc<Mutex<Option<AiServer>>>;
@@ -191,9 +191,13 @@ impl Runner {
         Ok(())
     }
 
-    pub fn run(&mut self, steps: &mut [Step]) -> Result<()> {
-        for step in steps.iter_mut() {
+    pub fn run(&mut self, nodes: &mut [Node]) -> Result<()> {
+        for node in nodes.iter_mut() {
             self.check_stop()?;
+            if !node.text.is_empty() {
+                self.log(format!("▸ {}", node.text));
+            }
+            let Some(step) = node.step.as_mut() else { bail!("bước \"{}\" chưa được AI phân tích", node.text) };
             self.run_step(step)?;
         }
         Ok(())

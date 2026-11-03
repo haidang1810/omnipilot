@@ -192,18 +192,23 @@ impl AiServer {
         Ok(a.starts_with("yes") || a.starts_with("có"))
     }
 
-    /// Turns a Vietnamese description into a list of steps.
-    pub fn compile(&self, description: &str) -> Result<Vec<Step>> {
-        let answer = self.chat(
-            json!([{"role": "system", "content": COMPILE_PROMPT}, {"role": "user", "content": description}]),
-            2000,
-            true,
-        )?;
-        let v: Value = serde_json::from_str(strip_fences(&answer)).context("AI trả về kịch bản không đúng định dạng")?;
-        let steps = v.get("steps").cloned().unwrap_or(v);
-        let mut steps: Vec<Step> = serde_json::from_value(steps).context("AI trả về kịch bản không đúng định dạng")?;
-        crate::script::normalize(&mut steps);
-        Ok(steps)
+    /// Turns one step the user typed ("bấm xuất chiến góc phải dưới") into one action.
+    pub fn compile_step(&self, text: &str) -> Result<Step> {
+        if let Some(s) = parse_simple(text) {
+            return Ok(s);
+        }
+        let answer = self.chat(json!([{"role": "system", "content": STEP_PROMPT}, {"role": "user", "content": text}]), 300, true)?;
+        let v: Value = serde_json::from_str(strip_fences(&answer)).with_context(|| format!("AI không hiểu bước \"{text}\""))?;
+        // Small models sometimes wrap the answer in {"steps":[...]}; take the first one.
+        let v = match v.get("steps").and_then(|s| s.get(0)) {
+            Some(first) => first.clone(),
+            None => v,
+        };
+        let step: Step = serde_json::from_value(v).with_context(|| format!("AI không hiểu bước \"{text}\""))?;
+        if matches!(step, Step::Loop { .. }) {
+            bail!("Bước \"{text}\" nên dùng nút \"Thêm vòng lặp\" thay vì viết trong một bước");
+        }
+        Ok(crate::script::normalize(step))
     }
 }
 
@@ -239,27 +244,40 @@ fn parse_bbox(answer: &str, width: u32, height: u32) -> Option<Rect> {
     Some(Rect { x: x1, y: y1, w: x2 - x1, h: y2 - y1 })
 }
 
-const COMPILE_PROMPT: &str = r#"Bạn chuyển mô tả tiếng Việt về thao tác trong game Android thành danh sách bước JSON.
-Các loại bước:
-- {"op":"tap","target":"<mô tả nút>","hint":"<vị trí gợi ý hoặc rỗng>","dynamic":false}
-  dynamic=true nếu mục tiêu thay đổi mỗi lần chạy (vd "map chưa đi", "map tiếp theo", "nhiệm vụ chưa nhận").
-- {"op":"tap_all","target":"<mô tả nút>","hint":"","max":30}  bấm lần lượt mọi nút khớp cho đến khi không còn (dùng cho "nhận hết", "bấm tất cả").
-- {"op":"wait_until","target":"<màn hình/phần tử cần xuất hiện>","timeout_sec":300}
+/// "chờ 5 giây", "đợi 2s", "nghỉ 1 phút" – no AI needed.
+fn parse_simple(text: &str) -> Option<Step> {
+    let t = text.trim().to_lowercase();
+    if !["chờ", "đợi", "nghỉ", "wait"].iter().any(|w| t.starts_with(w)) {
+        return None;
+    }
+    let num: String = t.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ',').collect();
+    let n: f32 = num.replace(',', ".").parse().ok()?;
+    let rest = t.split_once(&num)?.1.trim();
+    let seconds = if rest.starts_with("phút") || rest.starts_with("p") || rest.starts_with("min") {
+        n * 60.0
+    } else if rest.starts_with("giây") || rest.starts_with("s") || rest.is_empty() {
+        n
+    } else {
+        return None;
+    };
+    Some(Step::Wait { seconds })
+}
+
+const STEP_PROMPT: &str = r#"Bạn chuyển MỘT bước thao tác trong game Android (tiếng Việt) thành đúng MỘT object JSON.
+Các loại:
+- {"op":"tap","target":"<tên nút>","hint":"<vị trí hoặc rỗng>","dynamic":false}
+  dynamic=true nếu mục tiêu thay đổi mỗi lần chạy (vd "map chưa đi", "ải mới nhất", "map tiếp theo", "nhiệm vụ chưa nhận").
+- {"op":"tap_all","target":"<tên nút>","hint":"","max":30}  dùng cho "nhận hết", "bấm tất cả".
+- {"op":"wait_until","target":"<màn hình/chữ/nút cần xuất hiện>","timeout_sec":300}  dùng cho "đợi xong", "đợi đến khi".
 - {"op":"wait","seconds":2}
-- {"op":"back"}
-- {"op":"loop","max":50,"steps":[...]}  lặp các bước bên trong; tự dừng khi một bước bên trong không tìm thấy nút.
 Quy tắc:
-- Các cụm "đi tiếp", "tiếp theo", "lặp lại", "cho đến khi" nghĩa là phải bọc các bước lặp trong loop.
-- "đóng", "đóng lại", "thoát", "quay lại" mà không nói rõ nút nào thì dùng target "nút đóng hoặc quay lại (dấu X hoặc mũi tên quay lại)".
-- target là tên nút như hiện trên màn hình; bỏ các từ chỉ vị trí ("bên phải", "góc trên") khỏi target và đưa vào hint.
+- target là tên nút/chữ như hiện trên màn hình. Từ chỉ vị trí ("góc phải dưới", "bên trái") đưa vào hint, không để trong target.
+- "đóng", "thoát", "quay lại" không nói rõ nút nào thì target = "nút đóng hoặc quay lại (dấu X hoặc mũi tên quay lại)".
+- Chỉ trả về một object, không thêm gì khác.
 
-Ví dụ 1: "vào phó bản bấm quét nhanh 3 lần rồi thoát"
-{"steps":[{"op":"tap","target":"nút Phó bản","hint":"","dynamic":false},{"op":"loop","max":3,"steps":[{"op":"tap","target":"nút Quét nhanh","hint":"","dynamic":false},{"op":"wait","seconds":2}]},{"op":"back"}]}
-Ví dụ 2: "vào thư nhận hết quà rồi đóng"
-{"steps":[{"op":"tap","target":"biểu tượng Thư","hint":"","dynamic":false},{"op":"tap_all","target":"nút Nhận quà","hint":"","max":30},{"op":"tap","target":"nút Đóng","hint":"","dynamic":false}]}
-
-TUYỆT ĐỐI không thêm bước mà mô tả không nói tới. Mỗi hành động trong mô tả là đúng một bước.
-Ví dụ 3: "mở túi đồ rồi đóng lại"
-{"steps":[{"op":"tap","target":"Túi đồ","hint":"","dynamic":false},{"op":"tap","target":"nút đóng hoặc quay lại (dấu X hoặc mũi tên quay lại)","hint":"","dynamic":false}]}
-
-Viết target bằng tiếng Việt ngắn gọn."#;
+Ví dụ:
+"bấm xuất chiến góc phải dưới" -> {"op":"tap","target":"Xuất chiến","hint":"góc phải dưới","dynamic":false}
+"chọn ải mới nhất" -> {"op":"tap","target":"ải mới nhất chưa hoàn thành","hint":"","dynamic":true}
+"nhận hết quà" -> {"op":"tap_all","target":"Nhận","hint":"","max":30}
+"đợi đánh xong" -> {"op":"wait_until","target":"màn hình kết quả trận đấu (Chiến thắng/Thất bại)","timeout_sec":300}
+"thoát ra" -> {"op":"tap","target":"nút đóng hoặc quay lại (dấu X hoặc mũi tên quay lại)","hint":"","dynamic":false}"#;

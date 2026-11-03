@@ -9,12 +9,20 @@ mod jobs;
 mod paths;
 mod script;
 mod setup;
+mod theme;
 mod vision;
 
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() == 4 && args[1] == "--cli" {
-        if let Err(e) = cli::run(args[2].parse().unwrap_or(0), &args[3]) {
+    if args.len() >= 3 && args[1] == "--analyse" {
+        if let Err(e) = cli::analyse(&args[2..]) {
+            eprintln!("Lỗi: {e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if args.len() >= 4 && args[1] == "--cli" {
+        if let Err(e) = cli::run(args[2].parse().unwrap_or(0), &args[3..]) {
             eprintln!("Lỗi: {e:#}");
             std::process::exit(1);
         }
