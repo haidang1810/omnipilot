@@ -221,6 +221,8 @@ pub enum Schedule {
     Repeat { pause_minutes: u32 },
     /// Run at fixed times every day ("HH:MM").
     Daily { times: Vec<String> },
+    /// Run once when Start is pressed, then stop.
+    Once,
 }
 
 impl Schedule {
@@ -229,6 +231,7 @@ impl Schedule {
             Schedule::Repeat { pause_minutes: 0 } => "Lặp liên tục".into(),
             Schedule::Repeat { pause_minutes } => format!("Lặp, nghỉ {pause_minutes} phút"),
             Schedule::Daily { times } => format!("Hằng ngày {}", times.join(", ")),
+            Schedule::Once => "Chạy 1 lần".into(),
         }
     }
 }

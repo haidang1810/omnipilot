@@ -856,6 +856,7 @@ impl App {
 fn demo_scenario(instances: &[Instance]) -> Scenario {
     let mut sc = Scenario::new();
     sc.name = "Đánh map cốt truyện".into();
+    sc.schedule = Schedule::Once;
     if let Some(i) = instances.iter().find(|i| i.running) {
         sc.instance_index = i.index;
     }
@@ -873,13 +874,18 @@ fn demo_scenario(instances: &[Instance]) -> Scenario {
 }
 
 fn schedule_ui(ui: &mut egui::Ui, ed: &mut Editor) {
+    let repeat = matches!(ed.sc.schedule, Schedule::Repeat { .. });
     let daily = matches!(ed.sc.schedule, Schedule::Daily { .. });
+    let once = ed.sc.schedule == Schedule::Once;
     ui.horizontal(|ui| {
-        if ui.selectable_label(!daily, format!("{} Lặp lại liên tục", ic::REPEAT)).clicked() {
+        if ui.selectable_label(repeat, format!("{} Lặp lại liên tục", ic::REPEAT)).clicked() {
             ed.sc.schedule = Schedule::Repeat { pause_minutes: ed.pause_text.trim().parse().unwrap_or(0) };
         }
         if ui.selectable_label(daily, format!("{} Chạy theo giờ", ic::CLOCK)).clicked() {
             ed.sc.schedule = Schedule::Daily { times: jobs::parse_times(&ed.times_text) };
+        }
+        if ui.selectable_label(once, format!("{} Chạy 1 lần", ic::PLAY_CIRCLE)).clicked() {
+            ed.sc.schedule = Schedule::Once;
         }
     });
     match &mut ed.sc.schedule {
@@ -902,6 +908,9 @@ fn schedule_ui(ui: &mut egui::Ui, ed: &mut Editor) {
             if times.is_empty() {
                 ui.colored_label(RED, "Chưa có giờ hợp lệ, vd: 08:00, 20:30");
             }
+        }
+        Schedule::Once => {
+            ui.label(theme::muted("Bấm Chạy là chạy hết các bước đúng một lần rồi tự dừng."));
         }
     }
 }
@@ -1019,7 +1028,11 @@ fn scenario_card(ui: &mut egui::Ui, sc: &mut Scenario, job: Option<&Job>, instan
             ui.vertical(|ui| {
                 ui.label(RichText::new(&sc.name).family(theme::bold()).size(17.0));
                 ui.horizontal(|ui| {
-                    let icon = if matches!(sc.schedule, Schedule::Daily { .. }) { ic::CLOCK } else { ic::REPEAT };
+                    let icon = match sc.schedule {
+                        Schedule::Daily { .. } => ic::CLOCK,
+                        Schedule::Once => ic::PLAY_CIRCLE,
+                        Schedule::Repeat { .. } => ic::REPEAT,
+                    };
                     theme::chip(ui, format!("{icon} {}", sc.schedule.describe()), ACCENT);
                     theme::chip(ui, format!("{} bước", script::leaf_count(&sc.steps)), MUTED);
                     if !sc.recorded {

@@ -18,7 +18,7 @@ Không cần cắt ảnh nút, không cần ghi tọa độ. AI chạy ngay trê
 1. Mở app. Lần đầu app tự tải AI về (~3,3GB, chỉ một lần).
 2. Bấm **Tạo kịch bản**:
    - Đặt tên, chọn giả lập.
-   - Chọn kiểu chạy: **Lặp lại liên tục** (có thể nghỉ X phút giữa các lượt) hoặc **Chạy theo giờ** (vd `08:00, 20:30` để tranh tài nguyên, làm nhiệm vụ hằng ngày).
+   - Chọn kiểu chạy: **Lặp lại liên tục** (có thể nghỉ X phút giữa các lượt), **Chạy theo giờ** (vd `08:00, 20:30` để tranh tài nguyên, làm nhiệm vụ hằng ngày) hoặc **Chạy 1 lần** (chạy hết các bước một lượt rồi tự dừng).
    - **Thêm bước**: mỗi ô là một bước, viết như nói chuyện ("bấm xuất chiến góc phải dưới", "đợi đánh xong", "chờ 3 giây", "nhận hết quà", "thoát ra").
    - **Thêm vòng lặp**: lặp một nhóm bước (vd đánh hết các map). Vòng lặp tự dừng khi một bước bên trong không tìm thấy nút.
    - **Xem AI hiểu thế nào** (tùy chọn): AI đọc từng bước, hiện cách hiểu bên dưới mỗi ô, chưa bấm gì vào game.

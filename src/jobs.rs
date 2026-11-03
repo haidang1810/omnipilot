@@ -145,6 +145,9 @@ fn worker(mut scenario: Scenario, ld_dir: PathBuf, instance: Instance, stop: Arc
             Err(e) => status(format!("Lỗi: {e:#}")),
         }
 
+        if scenario.schedule == Schedule::Once {
+            return; // the "Xong lượt" / "Lỗi" status above is the final word
+        }
         if let Schedule::Repeat { pause_minutes } = scenario.schedule {
             if pause_minutes > 0 {
                 status(format!("Nghỉ {pause_minutes} phút"));
